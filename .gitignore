@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Songs you've processed: downloaded audio, separated stems, generated scores
+output/
+
+# Downloaded automatically on first use:
+# the GAME vocal model (~190 MB, sha256-checked by game.py)
+models/
+# instrument samples cached by the viewer
+soundfonts/
+
+# macOS
+.DS_Store

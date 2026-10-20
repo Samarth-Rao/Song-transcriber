@@ -1,0 +1,15 @@
+# Python 3.11 (basic-pitch doesn't support newer versions)
+torch<2.9
+torchaudio<2.9
+demucs
+basic-pitch
+setuptools<81  # basic-pitch's resampy still imports pkg_resources
+music21
+verovio
+cairosvg  # needs `brew install cairo`
+pypdf
+soundfile
+torchcrepe
+onnxruntime  # runs GAME (models/ downloads itself, sha256-pinned)
+openai-whisper  # word timings only
+pillow
