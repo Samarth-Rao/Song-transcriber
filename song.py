@@ -390,6 +390,11 @@ def transcribe_vocals_ensemble(stem: Path, words):
                     pitch = round(crepe_midi)
         notes.append([s, e, int(pitch), 1.0, False])
 
+    import librosa
+    db = 20 * np.log10(librosa.feature.rms(y=y, frame_length=1024, hop_length=160)[0] + 1e-9)
+    notes = fill_missed_words(notes, words, f0, per)
+    notes = drop_wordless(notes, words, db)
+
     # A held note with another word starting partway through is really two notes on the same
     # pitch: split it where that word starts (snapped to a re-attack in the audio).
     dips = [i * 0.01 for i in sorted(syllable_dips(y, len(f0), 160))]
@@ -570,6 +575,74 @@ def absorb_short(notes, min_len):
         else:
             merged.append(n)
     return [tuple(n) for n in merged]
+
+
+def fill_missed_words(notes, words, f0, per, hop=0.01, min_gap=0.3, voiced=0.5):
+    """GAME sometimes marks a sung stretch as silence (seen: 2.7 s of a chorus line, which it
+    did find when given a shorter clip). Where words fall in a gap between notes and CREPE
+    hears a steady pitch, add one note per word at CREPE's median pitch."""
+    import numpy as np
+
+    if not words:
+        return notes
+    notes = sorted(notes)
+    edges = [(-1.0, notes[0][0] if notes else float("inf"))]
+    edges += [(a[1], b[0]) for a, b in zip(notes, notes[1:])]
+    edges += [(notes[-1][1], float("inf"))] if notes else []
+    added = []
+    for gs, ge in edges:
+        if ge - gs < min_gap:
+            continue
+        inside = [w for w in words if gs <= w[0] < ge]
+        for i, (ws, we, *_) in enumerate(inside):
+            end = min(inside[i + 1][0] if i + 1 < len(inside) else we, ge)
+            a, b = int(max(ws, gs) / hop), int(end / hop)
+            if b - a < 10:
+                continue
+            ok = (per[a:b] > 0.45) & (f0[a:b] > 0)
+            if ok.mean() < voiced:
+                continue
+            first = a + int(np.argmax(ok))
+            pitch = round(float(np.median(69 + 12 * np.log2(f0[a:b][ok] / 440))))
+            added.append([first * hop, end, pitch, 1.0, False])
+    if added:
+        log(f"Added {len(added)} notes for words the note model missed")
+    return sorted(notes + added)
+
+
+def drop_wordless(notes, words, db, hop=0.01, phrase_gap=0.6, quieter=5.0):
+    """In a song with lyrics, a phrase with no words that's clearly quieter than the singing
+    is backing vocals or another instrument bleeding into the vocal track - drop it. Also
+    drop single notes over an octave from both neighbours (separation artefacts)."""
+    import numpy as np
+
+    if not words or not notes:
+        return notes
+    level = lambda s, e: float(np.median(db[int(s / hop):max(int(e / hop), int(s / hop) + 1)]))
+    sung = np.median([level(n[0], n[1]) for n in notes])
+    phrases, cur = [], [notes[0]]
+    for n in notes[1:]:
+        if n[0] - cur[-1][1] >= phrase_gap:
+            phrases.append(cur)
+            cur = [n]
+        else:
+            cur.append(n)
+    phrases.append(cur)
+    kept, dropped = [], 0
+    for ph in phrases:
+        s, e = ph[0][0], ph[-1][1]
+        if not any(s - 0.3 <= w[0] <= e for w in words) and level(s, e) < sung - quieter:
+            dropped += len(ph)
+            continue
+        for i, n in enumerate(ph):
+            near = [ph[j][2] for j in (i - 1, i + 1) if 0 <= j < len(ph)]
+            if near and all(abs(n[2] - q) > 12 for q in near):
+                dropped += 1
+            else:
+                kept.append(n)
+    if dropped:
+        log(f"Dropped {dropped} notes with no words that are quieter than the singing")
+    return kept
 
 
 def snap_to_key(notes, k, max_len):
