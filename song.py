@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn a song (file or YouTube URL) into sheet music for one isolated part.
+"""Turn a song (file or link) into sheet music for one isolated part, or split it into parts.
 
 Pipeline: yt-dlp (optional) -> Demucs (stem separation) -> Basic Pitch (audio -> notes)
           -> quantize to a beat grid -> music21 (MusicXML) -> Verovio + cairosvg (PDF)
@@ -86,47 +86,187 @@ def decode_clean(src: Path, dest: Path, headroom_db=1.0) -> Path:
     import numpy as np
     import soundfile as sf
 
-    out = subprocess.run(["ffmpeg", "-v", "error", "-i", str(src), "-f", "f32le", "-ac", "2", "-"],
-                         capture_output=True)
-    if out.returncode != 0:
+    has_audio = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+                                "stream=codec_type", "-of", "csv=p=0", str(src)],
+                               capture_output=True, text=True).stdout.strip()
+    if not has_audio:
+        raise PipelineError(f"{src.name} has no audio track (or isn't an audio/video file).")
+    # Any format ffmpeg reads (it reads nearly all of them), as 44.1 kHz stereo float.
+    out = subprocess.run(["ffmpeg", "-v", "error", "-i", str(src), "-map", "0:a:0", "-f", "f32le",
+                          "-ac", "2", "-ar", "44100", "-"], capture_output=True)
+    if out.returncode != 0 or not out.stdout:
         raise PipelineError(f"Couldn't decode {src.name}: {out.stderr.decode().strip()[-300:]}")
-    rate = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
-                           "stream=sample_rate", "-of", "csv=p=0", str(src)],
-                          capture_output=True, text=True).stdout.strip().splitlines()[0]
+    rate = 44100
     x = np.frombuffer(out.stdout, dtype=np.float32).reshape(-1, 2)
     peak = float(np.abs(x).max()) or 1.0
     gain = min(1.0, 10 ** (-headroom_db / 20) / peak)
     if gain < 1.0:
         log(f"Lowered the level {-20 * np.log10(gain):.1f} dB so the decoded audio doesn't clip")
-    sf.write(str(dest), x * gain, int(rate), subtype="PCM_16")
+    sf.write(str(dest), x * gain, rate, subtype="PCM_16")
     return dest
+
+
+# Sites yt-dlp (the open-source downloader used here) downloads from reliably, by host -
+# each checked working. Only links to these are accepted; anything else gets a clear message.
+DOWNLOAD_SITES = {
+    "youtube.com": "YouTube", "youtu.be": "YouTube", "music.youtube.com": "YouTube Music",
+    "youtube-nocookie.com": "YouTube", "soundcloud.com": "SoundCloud", "on.soundcloud.com": "SoundCloud",
+    "bandcamp.com": "Bandcamp", "dailymotion.com": "Dailymotion", "dai.ly": "Dailymotion",
+    "archive.org": "Internet Archive", "mixcloud.com": "Mixcloud",
+}
+# Streaming services that don't allow downloads: their links are looked up by title and artist
+# and the same song is fetched from YouTube instead.
+LOOKUP_SITES = {"open.spotify.com": "Spotify", "music.apple.com": "Apple Music",
+                "deezer.com": "Deezer", "tidal.com": "TIDAL", "listen.tidal.com": "TIDAL"}
+
+
+def single_song_path(site: str, path: str, query: str) -> bool:
+    """Whether a link's path is one song (not a playlist, album or profile) on that site."""
+    seg = [p for p in path.split("/") if p]
+    if site == "SoundCloud":     # /<user>/<track>; /<user>/sets/<set> is a playlist
+        return len(seg) >= 2 and seg[1] not in ("sets", "albums", "tracks", "likes", "reposts")
+    if site == "Bandcamp":
+        return "track" in seg
+    if site in ("Spotify", "Deezer", "TIDAL"):
+        return "track" in seg
+    if site == "Apple Music":
+        return "song" in seg or ("album" in seg and "i=" in query)
+    if site == "Mixcloud":       # /<user>/<mix>/
+        return len(seg) >= 2 and seg[0] not in ("discover", "categories")
+    return True
+
+
+def site_of(host: str):
+    """('download' | 'lookup', site name) for a link's host, or None."""
+    host = host.lower().removeprefix("www.").removeprefix("m.")
+    for table, kind in ((DOWNLOAD_SITES, "download"), (LOOKUP_SITES, "lookup")):
+        for domain, name in table.items():
+            if host == domain or host.endswith("." + domain):
+                return kind, name
+    return None
+
+
+def supported_sites() -> str:
+    names = list(dict.fromkeys([*DOWNLOAD_SITES.values(), *LOOKUP_SITES.values()]))
+    return ", ".join(names)
+
+
+def song_link(url: str):
+    """Check a pasted link and reduce it to one song. Returns (kind, site, url)."""
+    from urllib.parse import urlparse, urlunparse
+
+    url = url.strip()
+    parsed = urlparse(url)
+    site = site_of(parsed.hostname or "")
+    if not site:
+        raise PipelineError(f"Links from {parsed.hostname or 'that site'} aren't supported. "
+                            f"Try one from: {supported_sites()}. Or download the audio and choose the file.")
+    kind, name = site
+    if name.startswith("YouTube"):
+        return kind, name, clean_url(url)
+    if not single_song_path(name, parsed.path, parsed.query):
+        raise PipelineError(f"That {name} link isn't a single song (is it a playlist, album or profile?). "
+                            "Open the song itself and copy that link.")
+    # Drop tracking / "playing from this playlist" parameters (SoundCloud's ?in=, ?si=, ...);
+    # Apple Music's ?i= is the song within an album page, so it stays.
+    query = parsed.query if name == "Apple Music" else ""
+    return kind, name, urlunparse(parsed._replace(query=query, fragment=""))
+
+
+def lookup_song(site: str, url: str):
+    """(artist, title, seconds or None) for a streaming-service song link, read from its
+    public page / API (no account needed)."""
+    import html
+    import urllib.request
+
+    ua = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
+    get = lambda u: urllib.request.urlopen(urllib.request.Request(u, headers=ua), timeout=20).read().decode("utf-8", "ignore")
+    try:
+        if site == "Spotify":
+            m = re.search(r"/track/([A-Za-z0-9]+)", url)
+            if m:
+                page = get(f"https://open.spotify.com/embed/track/{m.group(1)}")
+                data = json.loads(re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page, re.S).group(1))
+                ent = data["props"]["pageProps"]["state"]["data"]["entity"]
+                return ", ".join(a["name"] for a in ent.get("artists", [])), ent["name"], (ent.get("duration") or 0) / 1000 or None
+        elif site == "Deezer":
+            m = re.search(r"/track/(\d+)", url)
+            if m:
+                t = json.loads(get(f"https://api.deezer.com/track/{m.group(1)}"))
+                if "title" in t:
+                    return t["artist"]["name"], t["title"], t.get("duration")
+        else:   # Apple Music, TIDAL: "<title> by <artist> on ..." in the page's og:title / title
+            page = get(url)
+            meta = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]*)"', page)
+            text = html.unescape(meta.group(1) if meta else re.search(r"<title[^>]*>(.*?)</title>", page, re.S).group(1))
+            text = text.replace("\xa0", " ").strip("\u200e ")
+            m = re.match(r"(.+?) by (.+?) on (Apple Music|TIDAL)", text) or re.match(r"(.+?) - Song.*? by (.+?) - Apple Music", text)
+            if m:
+                dur = re.search(r"Duration:? (\d+):(\d\d)", page)
+                return m.group(2), m.group(1), int(dur.group(1)) * 60 + int(dur.group(2)) if dur else None
+            m = re.match(r"(.+?) - (.+)", text)     # TIDAL's og:title is "Artist - Title"
+            if m:
+                return m.group(1), m.group(2), None
+    except Exception as e:
+        raise PipelineError(f"Couldn't read the song's details from {site} ({e}). "
+                            "Paste a YouTube link for it instead.")
+    raise PipelineError(f"Couldn't find a song on that {site} page. Copy the link of a single song.")
+
+
+def youtube_match(artist: str, title: str, seconds=None) -> str:
+    """URL of the YouTube video that best matches a song: of the top search results, the
+    first whose length is within 10 s of the song's (studio recordings, not live versions)."""
+    result = subprocess.run(["yt-dlp", "--flat-playlist", "-J", f"ytsearch5:{artist} - {title} audio"],
+                            capture_output=True, text=True)
+    try:
+        entries = [e for e in json.loads(result.stdout).get("entries", []) if e.get("id")]
+    except json.JSONDecodeError:
+        entries = []
+    if not entries:
+        raise PipelineError(f"Couldn't find \"{title}\" by {artist} on YouTube. Paste a YouTube link instead.")
+    if seconds:
+        close = [e for e in entries if e.get("duration") and abs(e["duration"] - seconds) <= 10]
+        entries = close or entries
+    best = entries[0]
+    log(f"Matched on YouTube: {best.get('title', best['id'])}")
+    return f"https://www.youtube.com/watch?v={best['id']}"
 
 
 def fetch_audio(source: str, out_root: Path) -> Path:
     out_root.mkdir(parents=True, exist_ok=True)
     if re.match(r"https?://", source.strip()):
-        source = clean_url(source)
-        log(f"Downloading audio from {source}")
-        tmpl = str(out_root / "%(title)s.%(ext)s")
-        # Original audio stream (no conversion by yt-dlp - see decode_clean).
+        kind, site, url = song_link(source)
+        if kind == "lookup":
+            artist, title, seconds = lookup_song(site, url)
+            log(f"{site} doesn't allow downloads, so looking up \"{title}\" by {artist} on YouTube")
+            url = youtube_match(artist, title, seconds)
+        log(f"Downloading audio from {url}")
+        tmpl = str(out_root / "%(title).150B.%(ext)s")
+        # Original audio stream (no conversion by yt-dlp - see decode_clean). One item only,
+        # whatever the link turns out to be.
         result = subprocess.run(
-            ["yt-dlp", "-f", "bestaudio", "--no-playlist",
-             "--print", "after_move:filepath", "-o", tmpl, source],
+            ["yt-dlp", "-f", "bestaudio/best", "--no-playlist", "--playlist-items", "1", "--max-downloads", "1",
+             "--print", "after_move:filepath", "-o", tmpl, url],
             capture_output=True, text=True,
         )
-        if result.returncode != 0 or not result.stdout.strip():
-            raise PipelineError(f"yt-dlp failed:\n{result.stderr.strip()}\n\n"
-                                "If YouTube changed something, updating usually fixes it: brew upgrade yt-dlp")
+        # 101 = stopped at --max-downloads, i.e. success
+        if result.returncode not in (0, 101) or not result.stdout.strip():
+            raise PipelineError(f"yt-dlp couldn't download that link:\n{result.stderr.strip()[-600:]}\n\n"
+                                "If the site changed something, updating usually fixes it: brew upgrade yt-dlp")
         original = Path(result.stdout.strip().splitlines()[-1])
         audio = decode_clean(original, original.with_suffix(".wav"))
-        original.unlink()
-        audio.with_suffix(".url").write_text(source)   # lets us fetch its captions later
+        if original != audio:
+            original.unlink()
+        audio.with_suffix(".url").write_text(url)   # lets us fetch its captions later
         return audio
     path = Path(source).expanduser().resolve()
     if not path.exists():
         raise PipelineError(f"File not found: {path}")
     # Work from a clean WAV copy; the original file is left untouched.
     dest = out_root / f"{path.stem}.wav"
+    if path == dest:
+        return dest
     if not dest.exists() or dest.stat().st_mtime < path.stat().st_mtime:
         decode_clean(path, dest)
     return dest
@@ -151,10 +291,85 @@ def separate(audio: Path, part: str, out_dir: Path) -> Path:
     return stem
 
 
+# ---------------------------------------------------------------- splitting into parts
+
+SPLIT_MODELS = {   # Demucs models: parts each one separates
+    "htdemucs": ["vocals", "drums", "bass", "other"],
+    "htdemucs_6s": ["vocals", "drums", "bass", "guitar", "piano", "other"],
+}
+
+
+def split_dir(audio: Path, model: str) -> Path:
+    return ROOT / "output" / audio.stem / "separated" / model / audio.stem
+
+
+def split_parts(audio: Path, model: str) -> list[str]:
+    """Parts already separated for this song with this model (empty if not split yet)."""
+    d = split_dir(audio, model)
+    parts = [p for p in SPLIT_MODELS[model] if (d / f"{p}.wav").exists()]
+    if len(parts) < len(SPLIT_MODELS[model]):
+        return []
+    return parts + [p for p in ("lead_vocals", "backing_vocals") if (d / f"{p}.wav").exists()]
+
+
+def split_song(source: str, model="htdemucs", vocal_layers=False) -> Path:
+    """Separate a song into all of a model's parts (and optionally the vocals into lead and
+    backing). Returns the song's audio path."""
+    import numpy as np
+    import soundfile as sf
+
+    audio = fetch_audio(source, ROOT / "output" / "_downloads")
+    d = split_dir(audio, model)
+    if not split_parts(audio, model):
+        import torch
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        n = len(SPLIT_MODELS[model])
+        log(f"Splitting into {n} parts with Demucs ({model} on {device}) - this takes a minute or two")
+        result = subprocess.run(
+            [sys.executable, "-m", "demucs", "-n", model, "-d", device,
+             "-o", str(d.parent.parent), str(audio)], capture_output=True, text=True)
+        if result.returncode != 0 or not split_parts(audio, model):
+            raise PipelineError("Demucs failed:\n" + "\n".join(result.stderr.strip().splitlines()[-15:]))
+    if vocal_layers and not (d / "backing_vocals.wav").exists():
+        import karaoke
+        log("Splitting the vocals into lead and backing")
+        lead, back = karaoke.split(d / "vocals.wav")
+        for name, y in (("lead_vocals", lead), ("backing_vocals", back)):
+            sf.write(d / f"{name}.wav", np.clip(y.T, -1, 1), karaoke.SR, subtype="PCM_16")
+    log("Done")
+    return audio
+
+
+def mix_parts(audio: Path, model: str, gains: dict, dest: Path) -> Path:
+    """Sum the chosen parts at the given gains (1 = as in the song) into a 16-bit WAV, turned
+    down as a whole only if the sum would clip. Lead/backing vocals replace "vocals"."""
+    import numpy as np
+    import soundfile as sf
+
+    d = split_dir(audio, model)
+    mix = None
+    for part, gain in gains.items():
+        path = d / f"{part}.wav"
+        if gain <= 0 or not path.exists():
+            continue
+        y, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        mix = y * gain if mix is None else mix[:len(y)] + y[:len(mix)] * gain
+    if mix is None:
+        y, sr = sf.read(str(d / f"{SPLIT_MODELS[model][0]}.wav"), dtype="float32", always_2d=True)
+        mix = np.zeros_like(y)
+    peak = float(np.abs(mix).max())
+    if peak > 0.99:
+        mix *= 0.99 / peak
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(dest), mix, sr, subtype="PCM_16")
+    return dest
+
+
 # ---------------------------------------------------------------- transcription
 
 def transcribe(stem: Path, part: str, mono: bool, words=()):
-    """Returns notes as (start_s, end_s, midi_pitch, strength, connected), sorted by start.
+    """Returns (notes, scored): notes as (start_s, end_s, midi_pitch, strength, connected),
+    sorted by start. `scored` means strength is a confidence (see note_confidence), not loudness.
 
     `connected` means the note follows the previous one without a break in the sound
     (sung on one breath / a bend), which is notated as a slur and played legato.
@@ -168,16 +383,16 @@ def transcribe(stem: Path, part: str, mono: bool, words=()):
             game.ensure_model()
         except Exception as e:   # can't install/load the model: fall back to CREPE only
             log(f"GAME unavailable ({e}); using CREPE pitch tracking instead")
-            notes = transcribe_vocals(stem)
+            notes, scored = transcribe_vocals(stem), False
         else:
-            notes = transcribe_vocals_ensemble(stem, words)
+            notes, scored = transcribe_vocals_ensemble(stem, words), True
     else:
-        notes = transcribe_basic_pitch(stem, part, mono)
+        notes, scored = transcribe_basic_pitch(stem, part, mono), False
     before = len(notes)
     notes = loudness_gate(stem, notes)
     if before - len(notes):
         log(f"Dropped {before - len(notes)} notes where the {part} track is near-silent")
-    return notes
+    return notes, scored
 
 
 def transcribe_basic_pitch(stem: Path, part: str, mono: bool):
@@ -206,15 +421,66 @@ def crepe_pitch(stem: Path, hop=0.01):
     import torch
     import torchcrepe
 
-    log("Tracking vocal pitch with CREPE")
+    import numpy as np
+
     y, _ = librosa.load(str(stem), sr=16000, mono=True)
+    # Cached next to the stem, so finding grace notes later doesn't need another pass.
+    cache = stem.with_name(f"{stem.stem}.crepe{int(hop * 1000)}ms.npy")
+    if cache.exists() and cache.stat().st_mtime >= stem.stat().st_mtime:
+        f0, per = np.load(cache)
+        return y, f0, per
+    log("Tracking vocal pitch with CREPE")
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     f0, per = torchcrepe.predict(torch.tensor(y)[None], 16000, hop_length=int(16000 * hop),
                                  fmin=65, fmax=1000, model="full", batch_size=1024,
                                  device=device, return_periodicity=True)
     per = torchcrepe.filter.median(per, 3)[0].cpu().numpy()
     f0 = torchcrepe.filter.mean(f0, 3)[0].cpu().numpy()
+    np.save(cache, np.stack([f0, per]))
     return y, f0, per
+
+
+def find_graces(notes, f0, per, hop=0.01, min_slide=0.06, max_slide=0.25, min_dev=1.5, max_dev=4.5):
+    """Scoops into notes, as {note start: pitch the voice slid in from}.
+
+    A scoop is a note whose pitch starts `min_dev`-`max_dev` semitones off (above or below) and
+    takes `min_slide`-`max_slide` s to arrive, then is held at least that long. Shorter
+    wobbles are just the attack. A slide that starts where the previous note left off (sung
+    straight on from it) is a legato connection, not a grace note."""
+    import numpy as np
+
+    midi = np.where((per > 0.45) & (f0 > 0), 69 + 12 * np.log2(np.maximum(f0, 1) / 440), np.nan)
+    graces = {}
+    for i, (s, e, p, *_) in enumerate(notes):
+        a = int(round(s / hop))
+        look = min(int(max_slide / hop), int((e - s) / hop) // 2)
+        dev = midi[a:a + look] - p
+        arrived = np.where(np.abs(dev) < 0.5)[0]
+        if not len(arrived):
+            continue
+        k = arrived[0]
+        pre = dev[:k][~np.isnan(dev[:k])]
+        if not min_slide / hop <= k or len(pre) < 4 or (e - s) - k * hop < k * hop:
+            continue
+        lead = float(np.median(pre[:max(3, len(pre) // 2)]))
+        if not min_dev <= abs(lead) <= max_dev:
+            continue
+        from_pitch = p + round(lead)
+        if i and s - notes[i - 1][1] < 0.08 and abs(notes[i - 1][2] - from_pitch) <= 1:
+            continue
+        graces[s] = from_pitch
+    return graces
+
+
+def add_graces(sidecar_path: Path):
+    """Find scoops for an already-transcribed vocal part (see find_graces) and store them."""
+    info = json.loads(sidecar_path.read_text())
+    _, f0, per = crepe_pitch(Path(info["stem"]))
+    off = info["audio_offset"]
+    notes = [(s + off, e + off, p) for s, e, p, *_ in info["notes"]]
+    info["graces"] = [[round(s - off, 4), p] for s, p in find_graces(notes, f0, per).items()]
+    sidecar_path.write_text(json.dumps(info))
+    return len(info["graces"])
 
 
 def whisper_words(stem: Path):
@@ -393,7 +659,13 @@ def transcribe_vocals_ensemble(stem: Path, words):
     import librosa
     db = 20 * np.log10(librosa.feature.rms(y=y, frame_length=1024, hop_length=160)[0] + 1e-9)
     notes = fill_missed_words(notes, words, f0, per)
-    notes = drop_wordless(notes, words, db)
+    # Notes that are probably not the lead singer sit out the word alignment below and come
+    # back at the end marked unsure, so only the Detailed level shows them.
+    junk = wordless_junk(notes, words, db)
+    unsure = [n for i, n in enumerate(notes) if i in junk]
+    notes = [n for i, n in enumerate(notes) if i not in junk]
+    if unsure:
+        log(f"Marked {len(unsure)} notes with no words that are quieter than the singing as unsure")
 
     # A held note with another word starting partway through is really two notes on the same
     # pitch: split it where that word starts (snapped to a re-attack in the audio).
@@ -428,6 +700,12 @@ def transcribe_vocals_ensemble(stem: Path, words):
             for k in joins:
                 notes[k][4] = k not in splits
         i = j + 1
+    for n in unsure:
+        n[4] = False
+    junk = {id(n) for n in unsure}
+    notes = sorted(notes + unsure)
+    for n, c in zip(notes, note_confidence(notes, f0, per, db)):
+        n[3] = min(c, 0.2) if id(n) in junk else c   # strength field = confidence
     return [tuple(n) for n in notes]
 
 
@@ -537,7 +815,12 @@ def fix_octave_jumps(notes, window=4.0, max_dist=12):
 
 # ---------------------------------------------------------------- smoothing (detail levels)
 
+# Simple: the bare tune, one in-key note per syllable on 8ths.
+# Balanced: every note we're sure of, as sung (runs, melismas, 16ths, grace notes).
+# Detailed: everything transcribed, notes we're unsure of included (drawn grey).
 DETAIL_LEVELS = ("simple", "balanced", "detailed")
+SURE = 0.5   # note confidence (see note_confidence) below which a note only shows in Detailed
+UNSURE_COLOR = "#8c95a6"
 
 
 def absorb_short(notes, min_len):
@@ -610,39 +893,65 @@ def fill_missed_words(notes, words, f0, per, hop=0.01, min_gap=0.3, voiced=0.5):
     return sorted(notes + added)
 
 
-def drop_wordless(notes, words, db, hop=0.01, phrase_gap=0.6, quieter=5.0):
-    """In a song with lyrics, a phrase with no words that's clearly quieter than the singing
-    is backing vocals or another instrument bleeding into the vocal track - drop it. Also
-    drop single notes over an octave from both neighbours (separation artefacts)."""
+def wordless_junk(notes, words, db, hop=0.01, phrase_gap=0.6, quieter=5.0):
+    """Indices of notes that are probably not the lead singer: in a song with lyrics, phrases
+    with no words that are clearly quieter than the singing (backing vocals or another
+    instrument bleeding into the vocal track), and single notes over an octave from both
+    neighbours (separation artefacts)."""
     import numpy as np
 
     if not words or not notes:
-        return notes
+        return set()
     level = lambda s, e: float(np.median(db[int(s / hop):max(int(e / hop), int(s / hop) + 1)]))
     sung = np.median([level(n[0], n[1]) for n in notes])
-    phrases, cur = [], [notes[0]]
-    for n in notes[1:]:
-        if n[0] - cur[-1][1] >= phrase_gap:
+    phrases, cur = [], [0]
+    for i in range(1, len(notes)):
+        if notes[i][0] - notes[cur[-1]][1] >= phrase_gap:
             phrases.append(cur)
-            cur = [n]
+            cur = [i]
         else:
-            cur.append(n)
+            cur.append(i)
     phrases.append(cur)
-    kept, dropped = [], 0
+    junk = set()
     for ph in phrases:
-        s, e = ph[0][0], ph[-1][1]
+        s, e = notes[ph[0]][0], notes[ph[-1]][1]
         if not any(s - 0.3 <= w[0] <= e for w in words) and level(s, e) < sung - quieter:
-            dropped += len(ph)
+            junk.update(ph)
             continue
-        for i, n in enumerate(ph):
-            near = [ph[j][2] for j in (i - 1, i + 1) if 0 <= j < len(ph)]
-            if near and all(abs(n[2] - q) > 12 for q in near):
-                dropped += 1
-            else:
-                kept.append(n)
-    if dropped:
-        log(f"Dropped {dropped} notes with no words that are quieter than the singing")
-    return kept
+        for j, i in enumerate(ph):
+            near = [notes[ph[x]][2] for x in (j - 1, j + 1) if 0 <= x < len(ph)]
+            if near and all(abs(notes[i][2] - q) > 12 for q in near):
+                junk.add(i)
+    return junk
+
+
+def note_confidence(notes, f0, per, db, hop=0.01):
+    """How sure we are of each note, 0-1, from what CREPE hears in its middle (edges are
+    attacks and slides): is it sung (voiced), on this pitch (median within a third of a
+    semitone), and held there (steady)? Very short notes and notes much quieter than the
+    singing count for less."""
+    import numpy as np
+
+    midi = np.where((per > 0.45) & (f0 > 0), 69 + 12 * np.log2(np.maximum(f0, 1) / 440), np.nan)
+    levels = [float(np.median(db[int(s / hop):max(int(e / hop), int(s / hop) + 1)])) for s, e, *_ in notes]
+    sung = float(np.median(levels)) if levels else 0.0
+    clip = lambda x: min(max(x, 0.0), 1.0)
+    out = []
+    for (s, e, p, *_), lvl in zip(notes, levels):
+        a, b = int(s / hop), int(e / hop)
+        trim = (b - a) // 6
+        seg = midi[a + trim:max(b - trim, a + trim + 3)]
+        heard = seg[~np.isnan(seg)]
+        if len(heard) < 2:
+            out.append(0.0)
+            continue
+        voiced = clip(len(heard) / len(seg) / 0.6)
+        on_pitch = clip(1 - (abs(float(np.median(heard)) - p) - 0.3) / 0.5)
+        steady = float(np.mean(np.abs(heard - p) < 0.75))
+        length = clip((e - s - 0.06) / 0.09)
+        loud = clip(1 - (sung - lvl - 3) / 9)
+        out.append(round(min(voiced * on_pitch * steady, length, loud) ** 0.5, 3))
+    return out
 
 
 def snap_to_key(notes, k, max_len):
@@ -724,13 +1033,45 @@ def collapse_syllables(notes, k, bpm, hold_beats, snap_all, run_steps=False):
     return out
 
 
-def simplify(notes, detail, k, bpm):
-    """Apply a detail level to a monophonic line (see DETAIL_LEVELS)."""
-    if detail == "simple":      # the tune: one in-key note per syllable
-        notes = collapse_syllables(notes, k, bpm, hold_beats=2, snap_all=True)
-    elif detail == "balanced":  # one note per syllable, but keep clearly held note changes
-        notes = collapse_syllables(notes, k, bpm, hold_beats=0.75, snap_all=False, run_steps=True)
-    return notes
+def sure_notes(notes, min_conf=SURE):
+    """Drop the notes we're unsure of (strength field below `min_conf`) from a monophonic line
+    of (start, end, pitch, confidence, connected, lyric, ...). An unsure note in the middle of
+    a syllable is part of the note next to it, so that note takes over its time; one that
+    carries a word stays, since the word needs a note."""
+    out, pending = [], None
+    for n in map(list, notes):
+        if n[3] >= min_conf or n[5]:
+            if pending and n[4] and n[0] - pending[1] < 0.06:   # it led into this note
+                n[0] = pending[0]
+            out.append(n)
+            pending = None
+        elif n[4] and out and n[0] - out[-1][1] < 0.06:       # it trailed the note before
+            out[-1][1] = n[1]
+        else:
+            pending = n
+    return [tuple(n) for n in out]
+
+
+def simplify(notes, detail, k, bpm, scored=True):
+    """Apply a detail level (see DETAIL_LEVELS) to a monophonic line of
+    (start, end, pitch, confidence, connected, lyric, grace). Without confidence scores
+    (`scored` False: the strength field is loudness), Balanced falls back to one note per
+    syllable plus clearly held note changes and runs."""
+    if detail == "detailed":
+        return notes
+    if scored:
+        notes = sure_notes(notes)
+    if detail == "balanced" and scored:
+        # Short out-of-key notes are almost always a slide passing through, not a melody note.
+        return snap_to_key(notes, k, max_len=0.75 * 60 / bpm)
+    if detail == "balanced":
+        texts = {n[0]: n[5] for n in notes if n[5]}
+        return [(*n, texts.get(n[0]), None) for n in collapse_syllables(
+            [n[:5] for n in notes], k, bpm, hold_beats=0.75, snap_all=False, run_steps=True)]
+    texts = {n[0]: n[5] for n in notes if n[5]}
+    # A word always starts a new syllable, so each word keeps its first note's start.
+    return [(*n, texts.get(n[0]), None)
+            for n in collapse_syllables([n[:5] for n in notes], k, bpm, hold_beats=2, snap_all=True)]
 
 
 def loudness_gate(stem: Path, notes, floor_db=35):
@@ -837,41 +1178,119 @@ def fit_grid(onsets, bpm, search=True):
     return float(bpm), float(offset)
 
 
-def quantize(notes, bpm, grid=0.25, mono=False):
-    """Seconds -> quarter-note offsets snapped to `grid`.
+def triplet_beats(onsets, grid, min_notes=2, tol=0.07, margin=0.03):
+    """Beats (whole quarter notes from bar 1) whose onsets sit on triplet thirds rather than
+    on the straight `grid`. `onsets` are in quarter notes.
+
+    A beat fits triplets when every onset inside it is within `tol` of a third and together they
+    are at least `margin` closer to the thirds than to the straight grid. Written in triplets:
+    beats that fit with onsets on both thirds; a beat on the last third followed by a beat on
+    the first (a quarter-note triplet across both); and a beat with only a first-third onset if
+    it fits with twice the margin (otherwise it's more likely a late 16th). A lone last-third
+    onset is a swung 8th and stays straight. A triplet group also needs at least `min_notes`
+    notes starting in it (counting one on its downbeat), so a lone triplet doesn't turn an
+    easy rhythm into a hard one."""
+    import math
+
+    inside, on_beat = {}, set()
+    for t in onsets:
+        b = math.floor(t + 0.12)
+        f = t - b
+        if 0.15 < f < 0.85:
+            inside.setdefault(b, []).append(f)
+        elif f <= 0.15:
+            on_beat.add(b)
+
+    def fits(fs, m):
+        es = sum(abs(f - round(f / grid) * grid) for f in fs)
+        et = sum(abs(f - round(f * 3) / 3) for f in fs)
+        return all(abs(f - round(f * 3) / 3) <= tol for f in fs) and et + m <= es
+
+    def enough(*beats):
+        return sum(len(inside.get(b, ())) for b in beats) + (beats[0] in on_beat) >= min_notes
+
+    slots = {b: {round(f * 3) for f in fs} for b, fs in inside.items() if fits(fs, margin)}
+    trip = set()
+    for b, s in slots.items():
+        if s == {1, 2} and enough(b):
+            trip.add(b)
+        elif s == {2} and slots.get(b + 1, set()) & {1} and enough(b, b + 1):
+            trip |= {b, b + 1}
+        elif s == {1} and fits(inside[b], 2 * margin) and enough(b):
+            trip.add(b)
+    return trip
+
+
+def rhythm_pieces(start, dur, trip):
+    """Cut a note wherever the beat changes between straight and triplet, so each piece is
+    written in one kind of rhythm and tied to the next, instead of one note with an odd length
+    that can only be written as a 12:7-style tuplet."""
+    import math
+
+    cuts = [b for b in range(math.floor(start) + 1, math.ceil(start + dur))
+            if (b - 1 in trip) != (b in trip)]
+    edges = [start, *cuts, start + dur]
+    return [(x, y - x) for x, y in zip(edges, edges[1:])]
+
+
+def quantize(notes, bpm, grid=0.25, mono=False, min_triplet=2):
+    """Seconds -> quarter-note offsets (Fractions) snapped to `grid`, or to triplet thirds in
+    beats that are sung in triplets (see triplet_beats; `min_triplet` is its min_notes).
 
     Notes may carry a lyric as a 6th field. In a single line, a worded note that would land
-    on the same grid slot as the note before it moves to the next half-grid slot instead of
-    merging into it, so each word keeps its own note.
+    on the same slot as the note before it moves to the next half-grid slot (next third in a
+    triplet beat) instead of merging into it, so each word keeps its own note.
 
-    Returns {start: (dur, [(pitch, amp)], connected, lyric)}."""
+    A 7th field is a grace-note pitch, kept with the note it leads into.
+
+    Returns ({start: (dur, [(pitch, amp)], connected, lyric, grace)}, triplet beats); split each
+    note with rhythm_pieces before writing it."""
+    import math
+    from fractions import Fraction
+
     beat = 60.0 / bpm
+    g = Fraction(grid).limit_denominator(64)
+    third = Fraction(1, 3)
+    # Triplet or straight is judged against 16ths (what's sung), even when writing on 8ths.
+    trip = triplet_beats([n[0] / beat for n in notes], min(grid, 0.25), min_triplet)
+
+    def step(t):
+        return third if math.floor(t) in trip else g
+
+    def snap(x):
+        b = math.floor(x)
+        if b in trip:
+            return b + Fraction(round((x - b) * 3), 3)
+        return b + round((x - b) / grid) * g
+
     events = {}
     prev = None
     for s, e, p, a, *rest in sorted(notes, key=lambda n: n[0]):
         connected = bool(rest and rest[0])
         lyric = rest[1] if len(rest) > 1 else None
-        qs = round(s / beat / grid) * grid
-        qe = max(round(e / beat / grid) * grid, qs + grid)
+        grace = rest[2] if len(rest) > 2 else None
+        qs = snap(s / beat)
+        qe = max(snap(e / beat), qs + step(qs))
         if mono and prev is not None and qs <= prev:
             if lyric and events[prev][3]:
-                qs = prev + grid / 2
-                qe = max(qe, qs + grid / 2)
+                bump = third if math.floor(prev) in trip else g / 2
+                qs = prev + bump
+                qe = max(qe, qs + bump)
             else:
                 qs = prev
-        dur, pitches, conn, lyr = events.get(qs, (0, [], connected, None))
+        dur, pitches, conn, lyr, gr = events.get(qs, (0, [], connected, None, grace))
         if p not in [x[0] for x in pitches]:
             pitches.append((p, a))
-        events[qs] = (max(dur, qe - qs), pitches, conn, lyr or lyric)
+        events[qs] = (max(dur, qe - qs), pitches, conn, lyr or lyric, gr)
         prev = qs
-    # One voice per staff: cut each event off at the next onset, and fill gaps of a 16th
+    # One voice per staff: cut each event off at the next onset, and fill gaps of a grid step
     # or less so the part reads legato instead of littered with tiny rests.
     starts = sorted(events)
     for i, st in enumerate(starts[:-1]):
-        dur, pitches, conn, lyr = events[st]
+        dur, pitches, conn, lyr, gr = events[st]
         gap = starts[i + 1] - st
-        events[st] = (gap if gap - dur <= grid else dur, pitches, conn, lyr)
-    return events
+        events[st] = (gap if gap - dur <= g else dur, pitches, conn, lyr, gr)
+    return events, trip
 
 
 def words_to_notes(notes, words, tol=0.25, min_len=0.08, reach=0.5):
@@ -906,42 +1325,237 @@ def words_to_notes(notes, words, tol=0.25, min_len=0.08, reach=0.5):
     return [tuple(n) for n in notes]
 
 
+def transcribe_harmony(stem: Path, lead_notes, min_len=0.1, level_db=-16.0):
+    """Backing-vocal notes (harmonies under/over the lead), in audio time.
+
+    The vocals stem is split into lead and backing vocals (karaoke.py), and GAME transcribes the
+    backing track. Kept: notes no more than `level_db` below the whole vocals track (quieter
+    is lead leaking through the split), that don't just double the lead in unison or octaves.
+    """
+    import librosa
+    import numpy as np
+    import soundfile as sf
+    import game
+    import karaoke
+
+    lead_path, back_path = stem.with_name(f"lead_{stem.name}"), stem.with_name(f"backing_{stem.name}")
+    if not back_path.exists():
+        log("Separating the lead vocal from the backing vocals")
+        lead, back = karaoke.split(stem)
+        for path, y in ((lead_path, lead), (back_path, back)):
+            sf.write(path, np.clip(y.T, -1, 1), karaoke.SR, subtype="PCM_16")
+    log("Transcribing the backing vocals with GAME")
+    raw = game.Game().transcribe(back_path)
+
+    hop, sr = 220, 22050
+    rms = lambda path: 20 * np.log10(librosa.feature.rms(
+        y=librosa.load(str(path), sr=sr, mono=True)[0], frame_length=2048, hop_length=hop)[0] + 1e-9)
+    back_db, all_db = rms(back_path), rms(stem)
+    notes = []
+    for s, e, score in raw:
+        a, b = int(s * sr / hop), max(int(e * sr / hop), int(s * sr / hop) + 1)
+        pitch = int(round(score))
+        if e - s < min_len or np.median(back_db[a:b] - all_db[a:b]) < level_db:
+            continue
+        under = [n[2] for n in lead_notes if min(e, n[1]) - max(s, n[0]) > 0.5 * (e - s)]
+        if under and all((pitch - q) % 12 == 0 for q in under):
+            continue   # the lead, doubled
+        notes.append((s, e, pitch, 1.0, False))
+    log(f"Found {len(notes)} harmony notes")
+    return notes, lead_path, back_path
+
+
+def add_harmony(sidecar_path: Path):
+    """Add backing-vocal harmony to an already transcribed vocals score (its .json sidecar)."""
+    info = json.loads(sidecar_path.read_text())
+    if info["part"] != "vocals":
+        raise PipelineError("Harmonies can only be added to a vocals score.")
+    offset = info["audio_offset"]
+    lead = [(n[0] + offset, n[1] + offset, n[2]) for n in info["notes"]]
+    notes, lead_path, back_path = transcribe_harmony(Path(info["stem"]), lead)
+    info["harmony"] = [[max(s - offset, 0), max(e - offset, 0), p, a, c] for s, e, p, a, c in notes]
+    info["lead_vocals"], info["backing_vocals"] = str(lead_path), str(back_path)
+    sidecar_path.write_text(json.dumps(info))
+    save_originals(sidecar_path)
+    return sidecar_path
+
+
 # ---------------------------------------------------------------- notation / rendering
 
-def build_score(notes, part, mono, bpm, title, time_sig, detail="simple", words=None, lyrics=True):
-    """Notes (seconds from bar 1) -> music21 Score at the given detail level.
+def tied_pieces(make, start, dur, trip):
+    """Elements for one note, cut by rhythm_pieces and tied together. `make()` builds each piece."""
+    from music21 import tie
 
-    `words` - optional [(start_s, end_s, text)] - each start a new note (see words_to_notes),
-    and with `lyrics` are written under them."""
-    from music21 import chord, clef, key, layout, metadata, meter, note, spanner, stream
+    pieces = rhythm_pieces(start, dur, trip)
+    els = []
+    for i, (s, d) in enumerate(pieces):
+        el = make()
+        el.quarterLength = d
+        if len(pieces) > 1:
+            el.tie = tie.Tie("start" if i == 0 else "stop" if i == len(pieces) - 1 else "continue")
+        els.append((s, el))
+    return els
 
-    # Key estimate from all notes, weighted by duration.
+
+def add_divisi(lead, harmony):
+    """Where the harmony sings, split the lead's bars into two voices: lead stems up, harmony
+    stems down (its rests hidden, so a part that only joins in briefly stays uncluttered)."""
+    from music21 import note, stream
+
+    for m1, m2 in zip(lead.getElementsByClass(stream.Measure), harmony.getElementsByClass(stream.Measure)):
+        if not any(isinstance(n, note.Note) for n in m2.notesAndRests):
+            continue
+        v1, v2 = stream.Voice(id="1"), stream.Voice(id="2")
+        for v, m, stem in ((v1, m1, "up"), (v2, m2, "down")):
+            for el in list(m.notesAndRests):
+                off = el.offset
+                m.remove(el)
+                if el.isRest:
+                    if v is v2:
+                        el.style.hideObjectOnPrint = True
+                else:
+                    el.stemDirection = stem
+                for t in el.duration.tuplets:   # triplet brackets on the stem side
+                    t.placement = "above" if stem == "up" else "below"
+                v.insert(off, el)
+        m1.insert(0, v1)
+        m1.insert(0, v2)
+
+
+# ---------------------------------------------------------------- scores as editable note lists
+#
+# A score is worked out in two steps: score_events turns the transcription into a "note list"
+# (plain JSON: concert pitch, positions in quarter notes from bar 1), and events_score draws a
+# note list with music21. The viewer edits note lists and saves them, so an edited score is
+# drawn exactly like a transcribed one. Note list format:
+#
+#   {"version": 1, "part", "mono", "bpm", "title", "time_sig": "4/4", "key": ["D", "major"],
+#    "length": "336" (quarter notes, rounded up to whole bars when drawn),
+#    "staves": [[note, ...], ...] (one staff, or treble + bass for chords),
+#    "harmony": [note, ...] (optional second voice for the first staff)}
+#   note: {"q": "17/3" (start), "d": "1/3" (length), "p": [54] (MIDI pitches; several = a chord),
+#          "lyric": "word", "slur": true (slurred from the note before), "grace": 52 (a grace
+#          note's pitch), "unsure": true (drawn grey)} - all but q, d and p optional.
+
+EVENTS_VERSION = 1
+
+
+def _frac(x) -> str:
+    from fractions import Fraction
+    return str(Fraction(x).limit_denominator(960))
+
+
+def detect_key(notes):
+    """Key estimate from all notes, weighted by duration (seconds)."""
+    from music21 import key, note, stream
+
     probe = stream.Stream()
     for s, e, p, *_ in notes:
         n = note.Note(p)
-        n.quarterLength = max(round((e - s) * bpm / 60 * 4) / 4, 0.25)
+        n.quarterLength = max(round((e - s) * 4) / 4, 0.25)
         probe.append(n)
-    k = probe.analyze("key") if notes else key.Key("C")
+    return probe.analyze("key") if notes else key.Key("C")
 
+
+def score_events(notes, part, mono, bpm, title, time_sig, detail="simple", words=None,
+                 harmony=None, graces=None, scored=False) -> dict:
+    """Notes (seconds from bar 1) -> a note list (see above) at the given detail level.
+
+    `words` - optional [(start_s, end_s, text)] - each start a new note (see words_to_notes)
+    and become lyrics. `harmony` - optional backing-vocal notes - becomes the second voice.
+    `graces` - optional [(note start_s, pitch)] scoops (see find_graces) - become grace notes,
+    except at the Simple level (just the tune). `scored`: the notes' strength field is a
+    confidence (see note_confidence), which decides what Balanced leaves out and Detailed
+    marks unsure."""
+    import math
+    from music21 import meter
+
+    k = detect_key([(s * bpm / 60, e * bpm / 60, p) for s, e, p, *_ in notes])
     if mono:
         if words:
             notes = words_to_notes(notes, words)
-        texts = {n[0]: n[5] for n in notes if len(n) > 5 and n[5]}
-        # Simplifying keeps each word's first note (a word always starts a new syllable).
-        notes = [(*n[:5], texts.get(n[0])) for n in simplify([n[:5] for n in notes], detail, k, bpm)]
+        grace_of = {round(s, 4): p for s, p in graces or ()}
+        notes = simplify([(*n[:5], n[5] if len(n) > 5 else None, grace_of.get(round(n[0], 4)))
+                          for n in notes], detail, k, bpm, scored)
     staves = [notes] if mono else [
         [n for n in notes if n[2] >= 60],  # treble
         [n for n in notes if n[2] < 60],   # bass
     ]
     grid = 0.5 if detail == "simple" else 0.25
+    # Outside Detailed, only write triplets where 3+ notes make the rhythm worth reading.
+    min_triplet = 2 if detail == "detailed" else 3
+    scale = {p.pitchClass for p in k.getScale().getPitches()}
 
+    def in_key_grace(g, main):
+        """The scale note nearest where the scoop starts, on the same side of the main note."""
+        side = 1 if g > main else -1
+        options = [x for x in (g, g - side, g + side) if x % 12 in scale and (x - main) * side > 0]
+        return options[0] if options else g
+
+    out_staves, end = [], 0
+    for staff_notes in staves:
+        evs = []
+        quantized, _ = quantize(staff_notes, bpm, grid, mono, min_triplet)
+        for start, (dur, pitches, connected, lyric, grace) in sorted(quantized.items()):
+            p = [max(pitches, key=lambda x: x[1])[0]] if mono else sorted({x[0] for x in pitches})
+            ev = {"q": _frac(start), "d": _frac(dur), "p": p}
+            if lyric:
+                ev["lyric"] = lyric
+            if mono and connected:
+                ev["slur"] = True
+            if mono and grace is not None:
+                ev["grace"] = in_key_grace(grace, p[0])
+            if scored and mono and detail == "detailed" and max(a for _, a in pitches) < SURE:
+                ev["unsure"] = True
+            evs.append(ev)
+            end = max(end, start + dur)
+        out_staves.append(evs)
+    bar = meter.TimeSignature(time_sig).barDuration.quarterLength
+    length = max(math.ceil(end / bar), 1) * bar
+
+    result = {"version": EVENTS_VERSION, "part": part, "mono": mono, "bpm": bpm, "title": title,
+              "time_sig": time_sig, "key": [k.tonic.name, k.mode], "length": _frac(length),
+              "staves": out_staves}
+    if mono and harmony:
+        quantized, _ = quantize(snap_to_key(sorted(harmony), k, max_len=float("inf")), bpm, grid,
+                                mono=True, min_triplet=min_triplet)
+        result["harmony"] = [{"q": _frac(s), "d": _frac(min(d, length - s)),
+                              "p": [max(pitches, key=lambda x: x[1])[0]]}
+                             for s, (d, pitches, *_) in sorted(quantized.items()) if s < length]
+    return result
+
+
+def events_triplets(events):
+    """Beats that hold triplet rhythm: some note starts or ends on a third of a beat."""
+    import math
+    from fractions import Fraction
+
+    trip = set()
+    for ev in events:
+        q, d = Fraction(ev["q"]), Fraction(ev["d"])
+        for t in (q, q + d):
+            if t.denominator % 3 == 0:
+                trip.add(math.floor(t))
+    return trip
+
+
+def events_score(ev: dict, lyrics=True, harmony=True):
+    """Draw a note list (see above) as a music21 Score. Every note gets the id "n<staff>-<i>"
+    ("h-<i>" in the harmony voice; "-<k>" on later tied pieces, "-g" on its grace note), so the
+    viewer can tell which listed note a drawn one is."""
+    import math
+    from fractions import Fraction
+    from music21 import chord, clef, key, layout, metadata, meter, note, spanner, stream
+    from music21 import pitch as m21pitch
+
+    k = key.Key(*ev["key"])
+    mono, time_sig = ev["mono"], ev["time_sig"]
     scale_names = {p.pitchClass: p.name for p in k.getScale().getPitches()}
 
     def spell(midi_num):
         """Spell from the key: scale notes as the scale names them, others sharp in sharp
         keys and flat in flat keys. Marked as deliberate so transposing keeps the spelling
         (music21 re-guesses spellings it considers inferred, e.g. F# up a 6th -> Eb)."""
-        from music21 import pitch as m21pitch
         name = scale_names.get(midi_num % 12)
         if name is None:
             name = m21pitch.Pitch(midi=midi_num).name
@@ -958,41 +1572,98 @@ def build_score(notes, part, mono, bpm, title, time_sig, detail="simple", words=
             p.accidental = None
         return p
 
-    score = stream.Score()
-    score.metadata = metadata.Metadata()
-    score.metadata.movementName = title
-    score.metadata.composer = f"{part} · {k.tonic.name} {k.mode} · {round(bpm)} BPM"
-    parts = []
-    for i, staff_notes in enumerate(staves):
+    def grace_note(midi_num):
+        n = note.Note(spell(midi_num)).getGrace()
+        n.duration.slash = True   # a quick scoop (acciaccatura), not a melody note
+        return n
+
+    all_events = [e for staff in ev["staves"] for e in staff] + list(ev.get("harmony") or [])
+    end = max([Fraction(e["q"]) + Fraction(e["d"]) for e in all_events] + [Fraction(ev["length"])])
+    bar = Fraction(meter.TimeSignature(time_sig).barDuration.quarterLength)
+    length = max(math.ceil(end / bar), 1) * bar
+
+    def build(events, prefix, words=True, staff_clef=None):
+        """One voice's notes as a Part, with ties where rhythm needs them, and slurs."""
         p = stream.Part()
-        # Treble by default (the viewer can switch single-staff parts to bass clef).
-        p.insert(0, clef.TrebleClef() if mono or i == 0 else clef.BassClef())
+        # Clef, key and time go in before the bars are made, so accidentals are worked out
+        # against the key signature (otherwise every sharp in the key gets written out).
+        p.insert(0, staff_clef or clef.TrebleClef())
         p.insert(0, key.KeySignature(k.sharps))
         p.insert(0, meter.TimeSignature(time_sig))
-        slurs, group, prev_end = [], [], None
-        for start, (dur, pitches, connected, lyric) in sorted(quantize(staff_notes, bpm, grid, mono).items()):
-            if mono:
-                el = note.Note(spell(max(pitches, key=lambda x: x[1])[0]))
-            else:
-                el = chord.Chord([spell(x[0]) for x in sorted(pitches)])
-            el.quarterLength = dur
-            if lyric and lyrics:
-                el.addLyric(lyric)
-            p.insert(start, el)
-            # Connected notes with no rest between them form a slur.
-            if mono and connected and group and prev_end == start:
-                group.append(el)
+        trip = events_triplets(events)
+        slurs, group, prev_end, drawn = [], [], None, []
+        for i, e in enumerate(events):
+            start, dur = Fraction(e["q"]), Fraction(e["d"])
+            if dur <= 0 or not e["p"]:
+                continue
+            pitches = [spell(m) for m in sorted(e["p"])]
+            make = (lambda: note.Note(pitches[0])) if len(pitches) == 1 else (lambda: chord.Chord(pitches))
+            pieces = tied_pieces(make, start, min(dur, length - start), trip)
+            if e.get("grace") is not None:
+                g = grace_note(e["grace"])
+                g.id = f"{prefix}-{i}-g"
+                p.insert(start, g)
+            for j, (s, el) in enumerate(pieces):
+                el.id = f"{prefix}-{i}" + (f"-{j}" if j else "")
+                if e.get("unsure"):
+                    el.style.color = UNSURE_COLOR
+                p.insert(s, el)
+            if words and lyrics and e.get("lyric"):
+                pieces[0][1].addLyric(e["lyric"])
+                if e.get("unsure"):   # the word itself isn't in doubt
+                    pieces[0][1].lyrics[0].style.color = "#000000"
+            els = [el for _, el in pieces]
+            drawn.append((e, els, start, start + dur))
+            # Slurred notes with no rest between them form a slur.
+            if e.get("slur") and group and prev_end == start:
+                group.extend(els)
             else:
                 if len(group) > 1:
                     slurs.append(group)
-                group = [el]
+                group = els
             prev_end = start + dur
         if len(group) > 1:
             slurs.append(group)
         for g in slurs:
             p.insert(0, spanner.Slur(g))
+        # A word sung over several slurred notes gets an extender line to its last note
+        # (marked here; the viewer writes it into the MusicXML, which music21 can't).
+        if words and lyrics:
+            for first, (e, els, _, _) in enumerate(drawn):
+                last = first
+                while e.get("lyric") and last + 1 < len(drawn) and drawn[last + 1][0].get("slur") \
+                        and not drawn[last + 1][0].get("lyric") and drawn[last + 1][2] == drawn[last][3]:
+                    last += 1
+                if last > first:
+                    els[0].editorial.extend = "start"
+                    drawn[last][1][-1].editorial.extend = "stop"
+        if p.highestTime < length:
+            p.insert(p.highestTime, note.Rest(quarterLength=length - p.highestTime))
         p.makeRests(fillGaps=True, inPlace=True)
         p.makeNotation(inPlace=True)
+        # Lengths no single note can show (e.g. 5 16ths) become tied notes here rather than on
+        # export, so every drawn note gets its own id. Halves keep their note's id (split
+        # here or at a barline); number the later ones.
+        p.splitAtDurations(recurse=True)
+        seen = {}
+        for n in p.recurse().notes:
+            if isinstance(n.id, str) and n.id in seen:
+                seen[n.id] += 1
+                n.id = f"{n.id}-b{seen[n.id]}"
+            else:
+                seen[n.id] = 0
+        return p
+
+    score = stream.Score()
+    score.metadata = metadata.Metadata()
+    score.metadata.movementName = ev["title"]
+    score.metadata.composer = f"{ev['part']} · {k.tonic.name} {k.mode} · {round(ev['bpm'])} BPM"
+    parts = []
+    for i, events in enumerate(ev["staves"]):
+        # Treble by default (the viewer can switch single-staff parts to bass clef).
+        p = build(events, f"n{i}", staff_clef=clef.TrebleClef() if mono or i == 0 else clef.BassClef())
+        if i == 0 and harmony and ev.get("harmony"):
+            add_divisi(p, build(ev["harmony"], "h", words=False))
         parts.append(p)
         score.insert(0, p)
     if len(parts) > 1:
@@ -1000,9 +1671,32 @@ def build_score(notes, part, mono, bpm, title, time_sig, detail="simple", words=
     return score
 
 
+def build_score(notes, part, mono, bpm, title, time_sig, detail="simple", words=None, lyrics=True,
+                harmony=None, graces=None, scored=False):
+    """Notes (seconds from bar 1) -> music21 Score at the given detail level (see score_events;
+    `lyrics` decides whether the words are shown)."""
+    return events_score(score_events(notes, part, mono, bpm, title, time_sig, detail, words,
+                                     harmony, graces, scored), lyrics, harmony=bool(harmony))
+
+
+def save_originals(sidecar_path: Path):
+    """Keep the transcription's note lists for all three detail levels, untouched by edits, in
+    originals/ next to the score (the viewer's edits go in edits/)."""
+    info = json.loads(sidecar_path.read_text())
+    folder = sidecar_path.parent / "originals"
+    folder.mkdir(exist_ok=True)
+    part = sidecar_path.stem
+    for detail in DETAIL_LEVELS:
+        ev = score_events([tuple(n) for n in info["notes"]], info["part"], info["mono"], info["bpm"],
+                          info["title"], info["time_sig"], detail, words=info.get("words"),
+                          harmony=info.get("harmony"), graces=info.get("graces"),
+                          scored=info.get("scored", False))
+        (folder / f"{part}.{detail}.json").write_text(json.dumps(ev))
+
+
 # ---------------------------------------------------------------- main
 
-def process(source: str, part="vocals", bpm=None, time_sig="4/4", poly=False) -> Path:
+def process(source: str, part="vocals", bpm=None, time_sig="4/4", poly=False, harmony=False) -> Path:
     """Full pipeline. Returns the MusicXML path (a PDF at concert pitch is written next to it)."""
     audio = fetch_audio(source, ROOT / "output" / "_downloads")
     out_dir = ROOT / "output" / audio.stem
@@ -1011,7 +1705,7 @@ def process(source: str, part="vocals", bpm=None, time_sig="4/4", poly=False) ->
 
     stem = separate(audio, part, out_dir)
     words = song_words(stem, audio) if part == "vocals" else []
-    notes = transcribe(stem, part, mono, words)
+    notes, scored = transcribe(stem, part, mono, words)
     if not notes:
         raise PipelineError(f"No notes detected in the {part} part.")
     notes_to_midi(notes, out_dir / f"{part}.mid")
@@ -1032,15 +1726,23 @@ def process(source: str, part="vocals", bpm=None, time_sig="4/4", poly=False) ->
     info = {
         "part": part, "mono": mono, "bpm": bpm, "time_sig": time_sig, "title": audio.stem,
         "audio_offset": offset,   # seconds into the audio where bar 1 starts
+        "scored": scored,         # note strengths are confidences (see note_confidence)
         "audio": str(audio), "stem": str(stem), "backing": str(stem.with_name(f"no_{part}.wav")),
         "notes": [[float(n[0]), float(n[1]), int(n[2]), float(n[3]), bool(n[4])] for n in notes],
         "words": [[max(s - offset, 0), max(e - offset, 0), text]
                   for s, e, text in align_words(raw_notes, words, split=False)[1]] if words else [],
     }
     (out_dir / f"{part}.json").write_text(json.dumps(info))
+    if part == "vocals" and mono:
+        log(f"Found {add_graces(out_dir / f'{part}.json')} scoops to write as grace notes")
+    if harmony and part == "vocals" and mono:
+        add_harmony(out_dir / f"{part}.json")
+    else:
+        save_originals(out_dir / f"{part}.json")
 
     log("Building score")
-    score = build_score(notes, part, mono, bpm, audio.stem, time_sig, words=info["words"], lyrics=False)
+    score = build_score(notes, part, mono, bpm, audio.stem, time_sig, words=info["words"], lyrics=False,
+                        scored=scored)
     k = score.recurse().getElementsByClass("KeySignature").first()
     log(f"Tempo {bpm:.0f} BPM, key signature: {viewer.key_name(k.sharps) if k else '?'}")
     xml = out_dir / f"{part}.musicxml"
@@ -1053,12 +1755,17 @@ def process(source: str, part="vocals", bpm=None, time_sig="4/4", poly=False) ->
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("source", help="audio file path or YouTube URL")
+    ap.add_argument("source", help="audio/video file, or a link (YouTube, SoundCloud, Spotify, ...)")
     ap.add_argument("-p", "--part", choices=PARTS, default="vocals", help="which part to transcribe (default: vocals)")
     ap.add_argument("--bpm", type=float, help="tempo override (auto-detected if omitted)")
     ap.add_argument("--time", default="4/4", help="time signature (default: 4/4)")
     ap.add_argument("--poly", action="store_true", help="allow chords even for vocals/bass")
+    ap.add_argument("--harmony", action="store_true",
+                    help="vocals: also transcribe the backing vocals' harmony (shown as a second voice)")
     ap.add_argument("--audio-only", action="store_true", help="just download/extract the audio and stop")
+    ap.add_argument("--split", type=int, choices=[4, 6],
+                    help="don't transcribe: split the song into 4 or 6 parts (WAVs, mix them in the viewer)")
+    ap.add_argument("--vocal-layers", action="store_true", help="with --split: also split vocals into lead and backing")
     ap.add_argument("--no-open", action="store_true", help="don't open the viewer when done")
     args = ap.parse_args()
 
@@ -1066,7 +1773,12 @@ def main():
         if args.audio_only:
             print(f"\nAudio saved to {fetch_audio(args.source, ROOT / 'output' / '_downloads')}")
             return
-        xml = process(args.source, args.part, args.bpm, args.time, args.poly)
+        if args.split:
+            audio = split_song(args.source, "htdemucs_6s" if args.split == 6 else "htdemucs", args.vocal_layers)
+            model = "htdemucs_6s" if args.split == 6 else "htdemucs"
+            print(f"\nParts saved in {split_dir(audio, model)}")
+            return
+        xml = process(args.source, args.part, args.bpm, args.time, args.poly, args.harmony)
     except PipelineError as e:
         sys.exit(str(e))
     print(f"\nDone. Files in {xml.parent}")
