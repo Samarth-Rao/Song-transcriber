@@ -32,8 +32,15 @@ _render_lock = threading.Lock()  # Verovio toolkits aren't thread-safe
 # Steinberg's Real Book-style hand-copied font, with its matching handwriting for the words
 # (Petaluma Script, in fonts/ with its SIL Open Font License; verified against Steinberg's repo).
 FONTS = ROOT / "fonts"
-STYLES = {"classic": {"music": "Leipzig", "text": None},
-          "jazz": {"music": "Petaluma", "text": ("Petaluma Script", FONTS / "PetalumaScript.otf")}}
+STYLES = {"classic": {"music": "Leipzig", "text": None, "lines": {}},
+          "jazz": {"music": "Petaluma", "text": ("Petaluma Script", FONTS / "PetalumaScript.otf"),
+                   # Felt-pen weight for everything Verovio draws as lines rather than glyphs.
+                   "lines": {"stemWidth": 0.3, "barLineWidth": 0.45, "staffLineWidth": 0.18,
+                             "ledgerLineThickness": 0.38, "thickBarlineThickness": 1.4,
+                             "slurMidpointThickness": 0.95, "slurEndpointThickness": 0.2,
+                             "tieMidpointThickness": 0.85, "tieEndpointThickness": 0.2,
+                             "lyricLineThickness": 0.35, "tupletBracketThickness": 0.32},
+                   "hand": True}}
 
 
 def register_fonts():
@@ -420,6 +427,7 @@ def render_svgs(xml: bytes, screen: bool, timing: bool = False, bars: int = 0, s
             "pageMarginLeft": MARGIN_X, "pageMarginRight": MARGIN_X,
             "adjustPageHeight": screen, "svgViewBox": screen, "footer": "none",
             "breaks": breaks, "noJustification": not justify, "font": look["music"], **LYRIC_LAYOUT,
+            **look["lines"],
         })
         tk.loadData(xml.decode())
         return tk
@@ -440,6 +448,8 @@ def render_svgs(xml: bytes, screen: bool, timing: bool = False, bars: int = 0, s
             svgs = [s.replace('font-family="Times, serif"', f'font-family="\'{look["text"][0]}\', Times, serif"')
                     for s in svgs]
         svgs = [align_lyrics(svg, look["text"] and look["text"][1]) for svg in svgs]
+        if look.get("hand"):
+            svgs = [pennify(svg, screen) for svg in svgs]
         if not timing:
             return svgs
         return svgs, playback_timing(tk)
@@ -619,7 +629,365 @@ def equal_bars(svgs, bars, avail):
 LYRIC_LAYOUT = {"lyricSize": 4.0, "lyricWordSpace": 5}
 
 
-@lru_cache(maxsize=1)
+def _absolute_path(d: str):
+    """An SVG path as absolute segments [(cmd, [x, y, ...])] using only M, L, C, Q and Z
+    (glyph outlines use relative curves, smooth curves and h/v lines)."""
+    import re
+
+    tokens = re.findall(r"[MmLlHhVvCcSsQqTtZz]|-?(?:\d+\.?\d*|\.\d+)(?:e-?\d+)?", d)
+    out, i, cmd = [], 0, None
+    x = y = sx = sy = 0.0
+    last_ctrl = None   # previous control point, for reflecting into S/T curves
+
+    def nums(n):
+        nonlocal i
+        vals = [float(t) for t in tokens[i:i + n]]
+        i += n
+        return vals
+
+    while i < len(tokens):
+        if tokens[i].isalpha():
+            cmd = tokens[i]
+            i += 1
+            if cmd in "Zz":
+                out.append(("Z", []))
+                x, y, last_ctrl = sx, sy, None
+                continue
+        rel = cmd.islower()
+        c = cmd.upper()
+        ox, oy = (x, y) if rel else (0.0, 0.0)
+        if c == "M":
+            px, py = nums(2)
+            x, y = ox + px, oy + py
+            sx, sy = x, y
+            out.append(("M", [x, y]))
+            cmd, last_ctrl = ("l" if rel else "L"), None
+        elif c == "L":
+            px, py = nums(2)
+            x, y, last_ctrl = ox + px, oy + py, None
+            out.append(("L", [x, y]))
+        elif c == "H":
+            (px,) = nums(1)
+            x, last_ctrl = ox + px, None
+            out.append(("L", [x, y]))
+        elif c == "V":
+            (py,) = nums(1)
+            y, last_ctrl = (y if rel else 0) + py, None
+            out.append(("L", [x, y]))
+        elif c in "CS":
+            if c == "C":
+                x1, y1, x2, y2, px, py = nums(6)
+                c1 = (ox + x1, oy + y1)
+            else:
+                x2, y2, px, py = nums(4)
+                c1 = (2 * x - last_ctrl[0], 2 * y - last_ctrl[1]) if last_ctrl else (x, y)
+            p = [c1[0], c1[1], ox + x2, oy + y2, ox + px, oy + py]
+            out.append(("C", p))
+            last_ctrl, x, y = (p[2], p[3]), p[4], p[5]
+        elif c in "QT":
+            if c == "Q":
+                x1, y1, px, py = nums(4)
+                c1 = (ox + x1, oy + y1)
+            else:
+                px, py = nums(2)
+                c1 = (2 * x - last_ctrl[0], 2 * y - last_ctrl[1]) if last_ctrl else (x, y)
+            p = [c1[0], c1[1], ox + px, oy + py]
+            out.append(("Q", p))
+            last_ctrl, x, y = c1, p[2], p[3]
+        else:
+            i += 1
+    return out
+
+
+# Photocopy grain on screen, in the SVG's units (~20 per screen pixel): noise frequency, how far
+# it pushes an edge, and the softening before the hard cut.
+GRAIN = {"soften": 1.5, "grain": 0.32, "amount": 15}
+
+
+def pennify(svg: str, screen: bool = True, variants: int = 4) -> str:
+    """Draw the page as if by a copyist's pen, for the Jazz look:
+
+    - every ruled line (staff lines, stems, barlines, ledger lines) becomes a filled ink stroke
+      with ragged edges whose width swells and thins along it; staff lines drift gently
+      (smoothly along each line, so the separately drawn bar segments still join up);
+    - beams get rough outlines;
+    - glyphs (noteheads, flags, rests, clefs, accidentals...) come in `variants` hand-warped
+      copies - wobbly outlines with a little grit, so no two notes are quite the same shape -
+      and each one drawn gets a copy, picked by its position, plus a slight tilt;
+    - on screen, an ink-bleed texture roughens every edge (PDFs can't show SVG filters).
+
+    All of it is seeded from positions, so a page looks the same every time it's drawn. Runs
+    after layout, so nothing the lyric alignment or equal-width bars measured moves."""
+    import math
+    import random
+    import re
+    import xml.etree.ElementTree as ET
+
+    SVG, XL = "http://www.w3.org/2000/svg", "http://www.w3.org/1999/xlink"
+    ET.register_namespace("", SVG)
+    ET.register_namespace("xlink", XL)
+    root = ET.fromstring(svg)
+    q = lambda tag: f"{{{SVG}}}{tag}"
+    # (equal-width bars rewrites these as "M 0 1207 L 9705 1207")
+    line_re = re.compile(r"^M\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*L\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*$")
+    rng = lambda *key: random.Random(":".join(k if isinstance(k, str) else str(round(k)) for k in key))
+
+    def wave(r, scale):
+        """A smooth random function of one variable: a few sine waves with random phases."""
+        ph = [r.uniform(0, 6.3) for _ in range(3)]
+        return lambda t: (math.sin(t / scale + ph[0]) + 0.5 * math.sin(t / (scale * 0.37) + ph[1])
+                          + 0.25 * math.sin(t / (scale * 0.13) + ph[2])) / 1.75
+
+    def ink_stroke(x1, y1, x2, y2, width, r, drift=None, step=45, pressure_amt=0.38, rough=0.55, bow=0.0):
+        """A pen line as a filled outline: ragged edges (`rough`), width swelling and thinning
+        (`pressure_amt`), bowed sideways by `bow` at its middle. `drift(x)` moves it sideways
+        as a function of absolute x (staff lines, so a line's bar segments join up)."""
+        length = math.hypot(x2 - x1, y2 - y1) or 1
+        ux, uy = (x2 - x1) / length, (y2 - y1) / length
+        nx, ny = -uy, ux
+        n = max(3, int(length / step))
+        pressure = wave(r, max(length / 2.5, 40))
+
+        def grit():   # edge roughness: random, then smoothed so it reads as ink, not hair
+            g = [r.uniform(-1, 1) for _ in range(n + 1)]
+            for _ in range(2):
+                g = [(g[max(i - 1, 0)] + 2 * g[i] + g[min(i + 1, n)]) / 4 for i in range(n + 1)]
+            return g
+        gl, gr = grit(), grit()
+        left, right = [], []
+        for i in range(n + 1):
+            s = length * i / n
+            px, py = x1 + ux * s, y1 + uy * s
+            off = (drift(px) if drift else 0) + bow * math.sin(math.pi * s / length)
+            half = width / 2 * (1 + pressure_amt * pressure(s))
+            el, er = half * (1 + rough * gl[i]), half * (1 + rough * gr[i])
+            cx, cy = px + nx * off, py + ny * off
+            left.append((cx + nx * el, cy + ny * el))
+            right.append((cx - nx * er, cy - ny * er))
+        return "M" + " L".join(f"{x:.0f} {y:.0f}" for x, y in left + right[::-1]) + "Z"
+
+    def drift_for(y):
+        r = rng("staffline", y)
+        w, tilt = wave(r, 2400), r.uniform(-1, 1) * 0.0003
+        return lambda x: 3 * w(x) + tilt * x
+
+    parent = {c: p for p in root.iter() for c in p}
+    cls = lambda el: (el.get("class") or "").split(" ")[0]
+
+    # ---- uneven spacing, like a hand: each note (with its stem, accidentals, dots, words)
+    # moves sideways a little - never more than a fraction of the gap to its neighbours, and
+    # less under lyrics - and beam ends and ledger lines follow their notes.
+    use_x = lambda el: next((float(m.group(1)) for u in el.iter(q("use"))
+                             for m in [re.search(r"translate\((-?[\d.]+),", u.get("transform", ""))] if m), None)
+    has_words = any(cls(g) == "syl" for g in root.iter(q("g")))
+    stem_dx, head_dx = {}, []
+    for layer in (g for g in root.iter(q("g")) if cls(g) == "layer"):
+        items = []
+        for el in layer.iter(q("g")):
+            if cls(el) not in ("note", "chord", "rest"):
+                continue
+            up, nested = parent.get(el), False
+            while up is not None and up is not layer:   # a note inside a chord moves with it
+                nested |= cls(up) == "chord"
+                up = parent.get(up)
+            x = use_x(el)
+            if not nested and x is not None:
+                items.append((x, el))
+        items.sort(key=lambda t: t[0])
+        for i, (x, el) in enumerate(items):
+            gaps = [abs(x - items[j][0]) for j in (i - 1, i + 1) if 0 <= j < len(items)] or [400]
+            room = min(min(gaps) * (0.12 if has_words else 0.22), 26 if has_words else 46)
+            dx = rng("space", x, use_x(el) or 0).uniform(-1, 1) * room
+            if abs(dx) < 1:
+                continue
+            el.set("transform", f"translate({dx:.0f}, 0)")
+            head_dx.append((x, dx))
+            for st in el.iter(q("g")):
+                if cls(st) == "stem":
+                    for p in st.iter(q("path")):
+                        m = re.match(r"M\s*(-?[\d.]+)", p.get("d", ""))
+                        if m:
+                            stem_dx[float(m.group(1))] = dx
+    for g in root.iter(q("g")):
+        if cls(g) == "beam":   # beam corners sit on stem x positions: move them with the stems
+            for poly in g.findall(q("polygon")):
+                pts = [tuple(map(float, p.split(","))) for p in poly.get("points", "").split()]
+                moved = []
+                for px, py in pts:
+                    near = min(stem_dx, key=lambda sx: abs(sx - px), default=None)
+                    moved.append((px + (stem_dx[near] if near is not None and abs(near - px) < 20 else 0), py))
+                poly.set("points", " ".join(f"{px:.0f},{py:.0f}" for px, py in moved))
+        elif cls(g) == "ledgerLines":   # a ledger line follows the note it sits under
+            for p in g.iter(q("path")):
+                m = re.match(r"^M\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*L\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*$", p.get("d", ""))
+                if not m:
+                    continue
+                x1, y1, x2, y2 = map(float, m.groups())
+                inside = [dx for hx, dx in head_dx if x1 - 30 <= hx <= x2]
+                if inside:
+                    p.set("d", f"M{x1 + inside[0]:.0f} {y1:.0f} L{x2 + inside[0]:.0f} {y2:.0f}")
+
+    def in_beam(el):
+        while el is not None:
+            if (el.get("class") or "").split(" ")[0] == "beam":
+                return True
+            el = parent.get(el)
+        return False
+
+    # ---- ruled lines -> ink strokes
+    for g in root.iter(q("g")):
+        kind = (g.get("class") or "").split(" ")[0]
+        for el in list(g):
+            tag = el.tag.split("}")[1]
+            if tag == "polyline" and el.get("stroke-width"):   # tuplet brackets and the like
+                pts = [tuple(map(float, p.split(","))) for p in el.get("points", "").split()]
+                w = float(el.get("stroke-width"))
+                r = rng(kind, *pts[0])
+                d = " ".join(ink_stroke(*a, *b, w * r.uniform(0.95, 1.2), r, step=30, pressure_amt=0.15, rough=0.35)
+                             for a, b in zip(pts, pts[1:]))
+                g.remove(el)
+                ET.SubElement(g, q("path"), {"d": d, "fill": "currentColor", "style": "stroke:none"})
+                continue
+            if kind in ("slur", "tie") and tag == "path":   # filled curves: a slight hand wobble
+                r = rng(kind, *map(float, re.findall(r"-?[\d.]+", el.get("d", ""))[:2] or [0]))
+                wx, wy = wave(r, 700), wave(r, 700)
+                el.set("d", " ".join(cmd + " ".join(f"{c:.0f}" for i in range(0, len(p), 2)
+                                                    for c in (p[i] + 6 * wx(p[i + 1]), p[i + 1] + 9 * wy(p[i])))
+                                     for cmd, p in _absolute_path(el.get("d", ""))))
+                continue
+            if kind == "beam" and tag == "polygon":
+                pts = [tuple(map(float, p.split(","))) for p in el.get("points", "").split()]
+                if len(pts) == 4:
+                    # A beam stays a parallelogram whose ends sit on the stems; the hand shows
+                    # only in a slight bow and an uneven ink edge (both edges move together, so
+                    # the thickness holds).
+                    r = rng("beam", *pts[0])
+                    (ax, ay), (bx, by), (cx, cy), (dx, dy) = pts
+                    n = max(6, int(abs(bx - ax) / 50))
+                    bow, sl, sr = r.uniform(-7, 7), r.uniform(-4, 4), r.uniform(-4, 4)
+                    et, eb = wave(r, 180), wave(r, 180)
+                    def shift(t):   # same for top and bottom edge at a point t (0..1) along the beam
+                        return sl * (1 - t) + sr * t + bow * math.sin(math.pi * t)
+                    top = [(ax + (bx - ax) * i / n, ay + (by - ay) * i / n + shift(i / n) + 3 * et(i * 50))
+                           for i in range(n + 1)]
+                    bot = [(dx + (cx - dx) * i / n, dy + (cy - dy) * i / n + shift(i / n) + 3 * eb(i * 50 + 700))
+                           for i in range(n + 1)]
+                    el.set("points", " ".join(f"{x:.0f},{y:.0f}" for x, y in top + bot[::-1]))
+                    el.set("fill-opacity", f"{r.uniform(0.9, 1):.2f}")
+                continue
+            m = tag == "path" and line_re.match(el.get("d", ""))
+            if not m:
+                continue
+            x1, y1, x2, y2 = map(float, m.groups())
+            w = float(el.get("stroke-width", "18"))
+            r = rng(kind, x1, y1, x2, y2)
+            if kind == "staff" and abs(y2 - y1) < 1:
+                el.set("data-line", f"{x1:.0f} {y1:.0f} {x2:.0f}")   # where it was ruled (for bar boxes)
+                d = ink_stroke(x1, y1, x2, y2, w * r.uniform(0.9, 1.1), r, drift=drift_for(y1), step=60,
+                               pressure_amt=0.06, rough=0.2)
+            elif kind == "stem":
+                length, beamed = abs(y2 - y1), in_beam(g)
+                # a little off-plumb; a beamed stem only barely, so its tip still meets the beam
+                lean = r.uniform(-4, 4) if beamed else r.choice((-1, 1)) * length * r.uniform(0.015, 0.045)
+                over = r.uniform(5, 30) if beamed and r.random() < 0.6 else 0   # poking past the beam
+                y2 += math.copysign(over, y2 - y1)
+                d = ink_stroke(x1, y1, x2 + lean, y2, w * r.uniform(1.0, 1.3), r, step=30,
+                               pressure_amt=0.2, rough=0.3, bow=r.uniform(-1, 1) * length * 0.015)
+            elif kind == "barLine":   # a steady width; it's the lean and the pen edge that vary
+                length = abs(y2 - y1)
+                lean = r.uniform(-1, 1) * length * 0.025
+                d = ink_stroke(x1, y1, x2 + lean, y2, w * r.uniform(0.95, 1.08), r, step=30,
+                               pressure_amt=0.08, rough=0.3, bow=r.uniform(-1, 1) * length * 0.02)
+            elif kind == "ledgerLines":
+                # a short, heavy marker dash, nearly level; a stack is only roughly even
+                tilt, nudge = r.uniform(-4, 4), r.uniform(-9, 9)
+                x1, x2 = x1 - r.uniform(-12, 14), x2 + r.uniform(-12, 14)
+                d = ink_stroke(x1, y1 + nudge - tilt, x2, y2 + nudge + tilt, w * r.uniform(1.8, 2.3), r,
+                               step=25, pressure_amt=0.12, rough=0.25, bow=r.uniform(-3, 3))
+            else:                       # any other ruled line: brackets, extender lines...
+                d = ink_stroke(x1, y1, x2, y2, w * r.uniform(0.9, 1.3), r)
+            el.set("d", d)
+            el.set("fill", "currentColor")
+            el.set("style", "stroke:none")   # Verovio's stylesheet strokes every path
+            el.set("fill-opacity", f"{r.uniform(0.8, 1):.2f}")
+            el.attrib.pop("stroke-width", None)
+
+    # ---- glyphs -> several hand-warped copies each
+    defs = root.find(q("defs"))
+    centre = {}   # glyph id -> the middle of its outline, in glyph units
+    if defs is not None:
+        for glyph in list(defs):
+            gid, path = glyph.get("id"), glyph.find(q("path"))
+            if not gid or path is None:
+                continue
+            segs = _absolute_path(path.get("d", ""))
+            xs = [p[i] for _, p in segs for i in range(0, len(p), 2)]
+            ys = [p[i] for _, p in segs for i in range(1, len(p), 2)]
+            if xs:
+                centre[gid] = ((min(xs) + max(xs)) / 2, -(min(ys) + max(ys)) / 2)   # paths are drawn flipped
+            for k in range(1, variants):
+                r = rng("glyph", gid.split("-")[0], k)
+                wx, wy = wave(r, 260), wave(r, 260)
+                d = []
+                for cmd, pts in segs:
+                    moved = []
+                    for i in range(0, len(pts), 2):
+                        x, y = pts[i], pts[i + 1]   # a smooth wobble of the outline, plus grit
+                        moved += [x + 12 * wx(y + 400) + r.uniform(-4, 4), y + 12 * wy(x + 900) + r.uniform(-4, 4)]
+                    d.append(cmd + " ".join(f"{c:.0f}" for c in moved))
+                copy = ET.SubElement(defs, glyph.tag, dict(glyph.attrib, id=f"{gid}-v{k}"))
+                ET.SubElement(copy, path.tag, dict(path.attrib, d=" ".join(d)))
+        for use in root.iter(q("use")):
+            href = use.get(f"{{{XL}}}href", "")
+            m = re.search(r"translate\((-?[\d.]+), (-?[\d.]+)\)", use.get("transform", ""))
+            if not href.startswith("#") or not m:
+                continue
+            r = rng("use", *map(float, m.groups()))
+            k = r.randrange(variants)
+            if k:
+                use.set(f"{{{XL}}}href", f"{href}-v{k}")
+            sm = re.search(r"scale\(([\d.]+), ([\d.]+)\)", use.get("transform", ""))
+            if not sm:
+                continue
+            sx, sy = float(sm.group(1)), float(sm.group(2))
+            base_id = href[1:].split("-v")[0]
+            if (parent.get(use) is not None and (parent[use].get("class") or "") == "notehead"
+                    and base_id in centre):
+                # a copyist's notehead: a long, steeply slanted blob, stretched and turned
+                # about its own middle so it stays where the stem meets it
+                gx, gy = centre[base_id]
+                ox, oy = gx * sx, gy * sy
+                tilt = r.uniform(-20, -6)
+                sx2, sy2 = sx * r.uniform(1.04, 1.16), sy * r.uniform(0.86, 0.96)
+                use.set("transform", f"translate({float(m.group(1)) + ox:.0f}, {float(m.group(2)) + oy:.0f}) "
+                                     f"rotate({tilt:.1f}) scale({sx2:.3f}, {sy2:.3f}) translate({-gx:.0f}, {-gy:.0f})")
+                continue
+            else:   # a rest is a short pen stroke: it can't be off by much; other glyphs a little
+                rest = parent.get(use) is not None and (parent[use].get("class") or "").split(" ")[0] in ("rest", "mRest", "multiRest")
+                size = r.uniform(0.98, 1.02) if rest else r.uniform(0.95, 1.06)
+                sx, sy, turn = sx * size, sy * size, f"rotate({r.uniform(-1.5, 1.5) if rest else r.uniform(-3, 3):.1f})"
+            use.set("transform", f"translate({m.group(1)}, {m.group(2)}) {turn} scale({sx:.3f}, {sy:.3f})")
+
+    # ---- on screen: photocopy grain. Fine noise pushes every edge pixel about, then a hard
+    # alpha cut turns the result into speckled, broken edges like a copied hand-written chart.
+    # It only moves ink that's there, so colours (highlighted, selected, unsure notes) stay.
+    if screen and defs is not None:
+        fid = f"ink-{root.get('id', 'page')}"
+        f = ET.SubElement(defs, q("filter"), {"id": fid, "x": "-1%", "y": "-1%", "width": "102%", "height": "102%",
+                                             "color-interpolation-filters": "sRGB"})
+        ET.SubElement(f, q("feTurbulence"), {"type": "fractalNoise", "baseFrequency": str(GRAIN["grain"]),
+                                             "numOctaves": "2", "seed": "5", "result": "noise"})
+        ET.SubElement(f, q("feDisplacementMap"), {"in": "SourceGraphic", "in2": "noise", "scale": str(GRAIN["amount"]),
+                                                  "xChannelSelector": "R", "yChannelSelector": "G", "result": "moved"})
+        ET.SubElement(f, q("feGaussianBlur"), {"in": "moved", "stdDeviation": str(GRAIN["soften"]), "result": "soft"})
+        ct = ET.SubElement(f, q("feComponentTransfer"), {"in": "soft"})
+        ET.SubElement(ct, q("feFuncA"), {"type": "table", "tableValues": "0 0.2 0.9 1 1 1"})   # firm, keeps thin lines
+        for page in root.iter(q("g")):
+            if (page.get("class") or "") == "page-margin":
+                page.set("filter", f"url(#{fid})")
+    return ET.tostring(root, encoding="unicode")
+
+
 @lru_cache(maxsize=4)
 def _lyric_font(path: Path | None = None):
     """The font the lyrics are drawn in, for measuring words: `path`, or the serif Verovio asks
@@ -1106,14 +1474,30 @@ PAGE = r"""<!doctype html>
            padding:calc(14px + env(safe-area-inset-top, 0px)) 28px 14px; }
   .bar { display:flex; flex-wrap:wrap; align-items:center; gap:12px 16px; max-width:1320px; margin:0 auto; }
   .bar + .bar { margin-top:12px; }
-  .title { display:flex; align-items:center; gap:10px; flex:1 1 220px; min-width:0; }
-  .toggles { display:flex; flex-wrap:wrap; align-items:center; gap:10px 16px; }
+  .title { display:flex; align-items:center; gap:14px; flex:1 1 360px; min-width:0; }
   #score { font:600 19px/1.2 var(--serif); border:0; background:transparent; padding:4px 26px 4px 2px;
-           min-width:0; width:100%; max-width:560px; text-overflow:ellipsis; cursor:pointer; appearance:none;
+           flex:1 1 auto; min-width:12ch; width:auto; max-width:640px; text-overflow:ellipsis; cursor:pointer; appearance:none;
            background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%235b6474' fill='none' stroke-width='1.5'/%3E%3C/svg%3E") right 8px center no-repeat; }
   #score:hover { color:var(--brass); }
   .actions { display:flex; gap:8px; flex-wrap:wrap; }
   .download { display:inline-flex; }
+  button.quiet.round { min-width:34px; padding:0; border-radius:50%; font-weight:600; border-color:var(--line); color:var(--muted); }
+  button.quiet.round:hover { color:var(--ink); border-color:#a9b0bc; }
+
+  /* ---- "View" menu: settings you set once, kept out of the toolbar */
+  #practiceBar { justify-content:flex-start; }
+  .menu { position:relative; margin-left:auto; }
+  .menu summary { list-style:none; cursor:pointer; border:1px solid var(--line); border-radius:8px; padding:6px 30px 6px 12px;
+                  min-height:34px; display:flex; align-items:center; background:var(--paper) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%235b6474' fill='none' stroke-width='1.5'/%3E%3C/svg%3E") right 11px center no-repeat; }
+  .menu summary::-webkit-details-marker { display:none; }
+  .menu summary:hover { border-color:#a9b0bc; }
+  .menu[open] summary { border-color:var(--brass-light); color:var(--brass); }
+  .menu-panel { position:absolute; right:0; top:calc(100% + 8px); z-index:6; background:var(--paper);
+                border:1px solid var(--line); border-radius:12px; padding:8px 16px;
+                box-shadow:0 12px 32px rgba(31,38,51,.16); display:grid; min-width:300px; }
+  .menu-panel .row { display:flex; align-items:center; justify-content:space-between; gap:24px; padding:10px 0; }
+  .menu-panel .row + .row { border-top:1px solid var(--line); }
+  .menu-panel .row[hidden] { display:none; }
   .download select { border-radius:8px 0 0 8px; border-right:0; }
   .download button { border-radius:0 8px 8px 0; }
   .group { display:flex; align-items:center; gap:7px; }
@@ -1181,17 +1565,20 @@ PAGE = r"""<!doctype html>
 
   /* ---- score */
   main { padding:28px 24px calc(140px + env(safe-area-inset-bottom, 0px)); display:flex; flex-direction:column;
-         align-items:center; gap:24px; }
-  .page { background:var(--paper); width:100%; max-width:1040px; border-radius:6px; padding:12px 8px;
+         align-items:safe center; gap:24px; overflow-x:auto; }
+  /* --page-w: the fitted width (up to 1040px) times the score zoom; zoomed in, pages scroll sideways */
+  .page { background:var(--paper); width:var(--page-w, 100%); max-width:none; flex:none; border-radius:6px; padding:12px 8px;
           box-shadow:0 1px 2px rgba(31,38,51,.08), 0 6px 24px rgba(31,38,51,.06); }
   .page svg { display:block; width:100%; height:auto; }
   #msg { padding:56px 24px; color:var(--muted); font-size:15px; text-align:center; }
   main.loading .page { opacity:.45; transition:opacity .15s; }
   .page g.note, .page g.chord, .page g.measure { cursor:pointer; }
   .page g.playing { fill:var(--brass); color:var(--brass); }
-  .page rect.measure-hl { fill:var(--brass-light); fill-opacity:.22; stroke:none; pointer-events:none; }
-  .page rect.measure-hit { fill:var(--brass-light); fill-opacity:0; stroke:none; pointer-events:all; cursor:pointer; }
-  .page rect.measure-hit:hover { fill-opacity:.12; }
+  .page rect.measure-hl { fill:var(--brass-light); fill-opacity:.22; stroke:none; pointer-events:none; display:none; }
+  body.playing .page rect.measure-hl { display:inline; }   /* the current bar, only while playing */
+  /* No fill until hovered (an invisible fill still shows through the Jazz look's ink filter). */
+  .page rect.measure-hit { fill:none; stroke:none; pointer-events:all; cursor:pointer; }
+  .page rect.measure-hit:hover { fill:var(--brass-light); fill-opacity:.12; }
 
   /* ---- playback bar: ink, floating clear of the window edge */
   #transport { position:fixed; z-index:3; left:16px; right:16px; bottom:calc(16px + env(safe-area-inset-bottom, 0px));
@@ -1217,7 +1604,7 @@ PAGE = r"""<!doctype html>
   /* ---- mode switch and the split view */
   #mode { flex:none; overflow:visible; }   /* never squeezed by a long song title */
   #mode button { font-weight:600; }
-  body.split header .bar + .bar, body.split .toggles, body.split .download, body.split .title #score,
+  body.split header .bar + .bar, body.split #viewMenu, body.split .download, body.split .title #score,
   body.split #status, body.split #pages, body.split #transport { display:none; }
   body.split #new .song-only, body:not(.split) #new .split-only { display:none; }
   #splitView { max-width:980px; margin:28px auto 140px; padding:0 28px; }
@@ -1281,6 +1668,17 @@ PAGE = r"""<!doctype html>
     main { padding-left:8px; padding-right:8px; padding-bottom:170px; }
     #transport { left:8px; right:8px; bottom:8px; padding:10px 12px; }
   }
+  /* ⌘P / File > Print: just the music, each score page on its own sheet, whatever the zoom */
+  @page { margin:12mm; }
+  @media print {
+    header, #status, #transport, #welcome, #new, #splitView, #sr, .lyric-input { display:none !important; }
+    body, main { background:#fff !important; padding:0 !important; margin:0 !important; overflow:visible !important; display:block !important; }
+    .page { width:100% !important; box-shadow:none !important; border-radius:0; padding:0; margin:0;
+            break-inside:avoid; break-after:page; }
+    .page:last-child { break-after:auto; }
+    .page svg { width:100% !important; height:auto; max-height:calc(100vh - 2px); }
+    .page rect.measure-hl, .page rect.measure-hit, .page g.sel { display:none; }
+  }
   @media (prefers-reduced-motion: reduce) { * { transition:none !important; scroll-behavior:auto !important; } }
 </style></head>
 <body>
@@ -1293,32 +1691,7 @@ PAGE = r"""<!doctype html>
       </div>
       <select id="score" aria-label="Song"></select>
     </div>
-    <div class="toggles">
-      <div class="group">
-        <span class="label">Lyrics</span>
-        <button id="lyricsBtn" title="Show the words under the notes">Off</button>
-      </div>
-      <div class="group" id="harmonyGroup" hidden>
-        <span class="label">Harmony</span>
-        <button id="harmonyBtn">Add</button>
-      </div>
-      <div class="group" role="group" aria-label="Clef">
-        <span class="label">Clef</span>
-        <div class="seg">
-          <button data-clef="treble">Treble</button>
-          <button data-clef="bass">Bass</button>
-        </div>
-      </div>
-      <div class="group" role="group" aria-label="Look">
-        <span class="label">Look</span>
-        <div class="seg">
-          <button data-style="classic" title="Engraved, like printed sheet music">Classic</button>
-          <button data-style="jazz" title="Hand-copied, like a jazz Real Book">Jazz</button>
-        </div>
-      </div>
-    </div>
     <div class="actions">
-      <button id="helpBtn" class="quiet" title="Show the introduction again">How it works</button>
       <button id="newBtn">New song</button>
       <button id="editBtn" hidden title="Change, add and delete notes, words and bars">Edit</button>
       <div class="download">
@@ -1327,19 +1700,29 @@ PAGE = r"""<!doctype html>
           <option value="musicxml">MusicXML</option>
           <option value="mid">MIDI</option>
         </select>
-        <button class="primary" id="pdf">Download</button>
+        <button class="primary" id="pdf" title="Download in the chosen format (⌘P / Ctrl+P prints the music, with a preview)">Download</button>
       </div>
+      <button id="helpBtn" class="quiet round" title="How it works" aria-label="How it works">?</button>
     </div>
   </div>
-  <div class="bar">
-    <div class="group" role="group" aria-label="Instrument">
-      <span class="label">Instrument</span>
+  <div class="bar" id="practiceBar">
+    <div class="group" role="group" aria-label="Detail">
+      <span class="label">Detail</span>
       <div class="seg">
-        <button data-preset="0">Concert C</button>
-        <button data-preset="9">Alto sax E♭</button>
-        <button data-preset="14">Tenor sax B♭</button>
-        <button data-preset="2" title="Trumpet, clarinet, soprano sax">Trumpet B♭</button>
+        <button data-detail="simple" title="Just the tune: one in-key note per word or syllable, 8th-note rhythm">Simple</button>
+        <button data-detail="balanced" title="Every note it's sure of, as sung: runs, 16ths, triplets and grace notes">Balanced</button>
+        <button data-detail="detailed" title="Everything it heard, with notes it's unsure of in grey">Detailed</button>
       </div>
+    </div>
+    <div class="group">
+      <label class="label" for="instSel">Instrument</label>
+      <select id="instSel" title="Shows the music in your instrument's key">
+        <option value="0">Concert C</option>
+        <option value="9">Alto sax E♭</option>
+        <option value="14">Tenor sax B♭</option>
+        <option value="2">Trumpet, clarinet B♭</option>
+        <option value="custom" hidden></option>
+      </select>
     </div>
     <div class="group" role="group" aria-label="Transpose">
       <span class="label">Transpose</span>
@@ -1350,23 +1733,50 @@ PAGE = r"""<!doctype html>
         <button data-step="12" title="Up an octave (↑)">+8va</button>
       </div>
     </div>
-    <div class="group" role="group" aria-label="Bars per line">
-      <span class="label">Bars per line</span>
+    <div class="group" role="group" aria-label="Zoom">
+      <span class="label">Zoom</span>
       <div class="seg">
-        <button id="barsAuto" title="Fit as many bars on each line as the music needs">Auto</button>
-        <button data-bars="-1" title="Fewer bars per line" aria-label="Fewer bars per line">−</button>
-        <button id="barsN" title="The same number of bars on every line, all the same width">4</button>
-        <button data-bars="1" title="More bars per line" aria-label="More bars per line">+</button>
+        <button data-zoom="-1" title="Zoom out (⌘− / Ctrl −)" aria-label="Zoom out">−</button>
+        <button id="zoomPct" title="Back to 100% (⌘0 / Ctrl 0)">100%</button>
+        <button data-zoom="1" title="Zoom in (⌘+ / Ctrl +, or pinch)" aria-label="Zoom in">+</button>
       </div>
     </div>
-    <div class="group" role="group" aria-label="Detail">
-      <span class="label">Detail</span>
-      <div class="seg">
-        <button data-detail="simple" title="Just the tune: one in-key note per word or syllable, 8th-note rhythm">Simple</button>
-        <button data-detail="balanced" title="Every note it's sure of, as sung: runs, 16ths, triplets and grace notes">Balanced</button>
-        <button data-detail="detailed" title="Everything it heard, with notes it's unsure of in grey">Detailed</button>
+    <details class="menu" id="viewMenu">
+      <summary>View</summary>
+      <div class="menu-panel">
+        <div class="row">
+          <span class="label">Lyrics</span>
+          <button id="lyricsBtn" title="Show the words under the notes">Off</button>
+        </div>
+        <div class="row" id="harmonyGroup" hidden>
+          <span class="label">Harmony</span>
+          <button id="harmonyBtn">Add</button>
+        </div>
+        <div class="row" role="group" aria-label="Clef">
+          <span class="label">Clef</span>
+          <div class="seg">
+            <button data-clef="treble">Treble</button>
+            <button data-clef="bass">Bass</button>
+          </div>
+        </div>
+        <div class="row" role="group" aria-label="Look">
+          <span class="label">Look</span>
+          <div class="seg">
+            <button data-style="classic" title="Engraved, like printed sheet music">Classic</button>
+            <button data-style="jazz" title="Hand-copied, like a jazz fake book">Jazz</button>
+          </div>
+        </div>
+        <div class="row" role="group" aria-label="Bars per line">
+          <span class="label">Bars per line</span>
+          <div class="seg">
+            <button id="barsAuto" title="Fit as many bars on each line as the music needs">Auto</button>
+            <button data-bars="-1" title="Fewer bars per line" aria-label="Fewer bars per line">−</button>
+            <button id="barsN" title="The same number of bars on every line, all the same width">4</button>
+            <button data-bars="1" title="More bars per line" aria-label="More bars per line">+</button>
+          </div>
+        </div>
       </div>
-    </div>
+    </details>
   </div>
   <div class="bar" id="editBar" aria-label="Edit the notes">
     <div class="group" id="voiceGroup" role="group" aria-label="Write into">
@@ -1581,7 +1991,10 @@ function label() {
   if (PRESETS[t]) return PRESETS[t];
   for (const base of [9, 14, 2, 0]) {          // e.g. "Alto Sax E♭ +8va"
     const d = t - base;
-    if (d && d % 12 === 0) return `${PRESETS[base]} ${d > 0 ? "+" : "−"}${Math.abs(d / 12)}8va`;
+    if (d && d % 12 === 0) {
+      const n = Math.abs(d / 12), sign = d > 0 ? "+" : "−";
+      return `${PRESETS[base]} ${n === 1 ? sign + "8va" : n === 2 ? sign + "15ma" : `${sign}${n} octaves`}`;
+    }
   }
   return `${t > 0 ? "+" : ""}${t} semitones`;
 }
@@ -1601,7 +2014,11 @@ async function render() {
   document.querySelectorAll("[data-detail]").forEach(b => b.classList.toggle("on", b.dataset.detail === detail));
   document.querySelectorAll("[data-style]").forEach(b => b.classList.toggle("on", b.dataset.style === look));
   store.set("style", look);
-  document.querySelectorAll("[data-preset]").forEach(b => b.classList.toggle("on", +b.dataset.preset === t));
+  // The instrument menu shows the preset, or e.g. "Alto sax E♭ +8va" / "+3 semitones" after transposing.
+  const custom = $("#instSel option[value=custom]");
+  custom.hidden = t in PRESETS;
+  custom.textContent = label();
+  $("#instSel").value = t in PRESETS ? String(t) : "custom";
   $("#pages").classList.add("loading");
   // While editing, draw the editor's note list (switching song or level loads that one's).
   if (editor.on && editor.slot !== file + "|" + detail && !(await editor.load())) return;
@@ -1615,6 +2032,7 @@ async function render() {
   if (!r.ok) { $("#pages").innerHTML = `<div id="msg">${await r.text()}</div>`; return; }
   const d = await r.json();
   $("#pages").innerHTML = d.svgs.map(s => `<div class="page">${s}</div>`).join("");
+  applyZoom(zoom, undefined, undefined, false);
   player.load(d);
   $("#lyricsBtn").disabled = !d.hasLyrics;
   $("#harmonyGroup").hidden = !d.canHarmony;
@@ -1642,7 +2060,8 @@ async function render() {
          <kbd>+</kbd> add after, <kbd>1</kbd>–<kbd>5</kbd> length, <kbd>.</kbd> dot, <kbd>T</kbd> triplet, <kbd>⌫</kbd> delete,
          <kbd>L</kbd> word, <kbd>S</kbd> slur, <kbd>/</kbd> grace, <kbd>←</kbd><kbd>→</kbd> next note
          (<kbd>⌥</kbd> move it), <kbd>⌘Z</kbd> undo</span>`
-      : (d.edited ? `<span><b>Edited</b> (the original is kept: Edit, then Revert to original)</span>` : "") +
+      : (detail === "detailed" ? `<span>Grey notes: ones the transcription is unsure of</span>` : "") +
+        (d.edited ? `<span><b>Edited</b> (the original is kept: Edit, then Revert to original)</span>` : "") +
         (editor.hasDraft() ? `<span class="warn">Unsaved edits: click Edit to finish them</span>` : "") +
         `<span><kbd>←</kbd><kbd>→</kbd> half step <kbd>↑</kbd><kbd>↓</kbd> octave</span>`);
   if ($("#enhBtn")) $("#enhBtn").onclick = () => { store.set("enh:" + t, enh() ? "0" : "1"); render(); };
@@ -1670,17 +2089,22 @@ $("#harmonyBtn").onclick = async () => {
 };
 function setT(v) { t = Math.max(-36, Math.min(36, v)); render(); }
 
-document.querySelectorAll("[data-preset]").forEach(b => b.onclick = () => {
-  inst = +b.dataset.preset;          // what the player's instrument is (playback sounds at concert pitch)
+$("#instSel").onchange = e => {
+  if (e.target.value === "custom") return;
+  inst = +e.target.value;            // what the player's instrument is (playback sounds at concert pitch)
   store.set("inst:" + file, inst);
   setT(inst);
-});
+};
+// The View menu closes on a click elsewhere or Escape, like any dropdown.
+document.addEventListener("click", e => { if (!e.target.closest("#viewMenu")) $("#viewMenu").open = false; });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && $("#viewMenu").open) { $("#viewMenu").open = false; $("#viewMenu summary").focus(); } });
 document.querySelectorAll("[data-step]").forEach(b => b.onclick = () => setT(t + +b.dataset.step));
 $("#dlFmt").value = store.get("dlFmt") || "pdf";
 $("#dlFmt").onchange = e => store.set("dlFmt", e.target.value);
-$("#pdf").onclick = () => {
-  location.href = `/api/export?fmt=${$("#dlFmt").value}&f=${encodeURIComponent(file)}&t=${t}&clef=${clef}&detail=${detail}&lyrics=${lyrics ? 1 : 0}&harmony=${harmony ? 1 : 0}&bars=${barsParam()}&style=${look}&enh=${enh() ? 1 : 0}&label=${encodeURIComponent(label())}`;
-};
+function download(fmt) {
+  location.href = `/api/export?fmt=${fmt}&f=${encodeURIComponent(file)}&t=${t}&clef=${clef}&detail=${detail}&lyrics=${lyrics ? 1 : 0}&harmony=${harmony ? 1 : 0}&bars=${barsParam()}&style=${look}&enh=${enh() ? 1 : 0}&label=${encodeURIComponent(label())}`;
+}
+$("#pdf").onclick = () => download($("#dlFmt").value);
 $("#score").onchange = e => loadList(e.target.value);
 document.addEventListener("keydown", e => {
   const inField = ["SELECT", "INPUT", "TEXTAREA", "BUTTON"].includes(e.target.tagName);
@@ -1699,6 +2123,44 @@ document.addEventListener("keydown", e => {
   if (step) { e.preventDefault(); setT(t + step); }
 });
 
+// ---- zoom: the score's own zoom (⌘+/⌘−/⌘0, pinch, ctrl+scroll, the Zoom buttons). Browser
+// zoom can't enlarge the score - it's sized to fit the window - so these zoom just the pages.
+const ZOOMS = [0.5, 0.67, 0.75, 0.85, 1, 1.15, 1.3, 1.5, 1.75, 2, 2.5, 3];
+let zoom = Math.min(3, Math.max(0.5, +(store.get("zoom") || 1)));
+function applyZoom(next, anchorX, anchorY, keepPlace = true) {
+  const main = $("#pages");
+  const fit = Math.min(1040, main.clientWidth - 48);   // the page's width at 100%
+  // Keep the point under the anchor (default: the middle of the window) where it is.
+  const ax = anchorX ?? innerWidth / 2, ay = anchorY ?? innerHeight / 2;
+  const box = main.getBoundingClientRect(), top = box.top + scrollY;
+  const fx = (main.scrollLeft + ax - box.left) / Math.max(main.scrollWidth, 1);
+  const fy = (scrollY + ay - top) / Math.max(main.scrollHeight, 1);
+  zoom = Math.min(3, Math.max(0.5, next));
+  store.set("zoom", zoom);
+  main.style.setProperty("--page-w", `${Math.round(fit * zoom)}px`);
+  $("#zoomPct").textContent = `${Math.round(zoom * 100)}%`;
+  if (!keepPlace) return;
+  main.scrollLeft = fx * main.scrollWidth - (ax - box.left);
+  scrollTo({top: top + fy * main.scrollHeight - ay});
+}
+const zoomStep = dir => ZOOMS.find(z => dir > 0 ? z > zoom + 1e-6 : false) ?? (dir < 0 ? [...ZOOMS].reverse().find(z => z < zoom - 1e-6) : null);
+function stepZoom(dir) { const z = zoomStep(dir); if (z) applyZoom(z); }
+document.querySelectorAll("[data-zoom]").forEach(b => b.onclick = () => stepZoom(+b.dataset.zoom));
+$("#zoomPct").onclick = () => applyZoom(1);
+addEventListener("resize", () => applyZoom(zoom));
+// pinch on a trackpad (and ctrl+scroll) arrive as ctrl+wheel events
+addEventListener("wheel", e => {
+  if (!e.ctrlKey || mode === "split") return;
+  e.preventDefault();
+  applyZoom(zoom * Math.exp(-e.deltaY * 0.002), e.clientX, e.clientY);   // ~20% per wheel notch
+}, {passive: false});
+addEventListener("keydown", e => {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey || mode === "split") return;
+  if (e.key === "=" || e.key === "+") { e.preventDefault(); stepZoom(1); }
+  else if (e.key === "-" || e.key === "_") { e.preventDefault(); stepZoom(-1); }
+  else if (e.key === "0") { e.preventDefault(); applyZoom(1); }
+}, true);
+
 // ---- playback
 // Notes come from Verovio's timemap (positions in quarter notes, written pitch). They sound at
 // concert pitch: written pitch minus the instrument's transposition (alto sax sounds a M6 lower).
@@ -1706,16 +2168,23 @@ const NAMES = ["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"];
 const midiName = m => NAMES[m % 12] + (Math.floor(m / 12) - 1);
 
 // A box around one measure, sized from its five staff lines only - not the notes, which
-// would make measures with high/low notes taller than the rest.
+// would make measures with high/low notes taller than the rest. Hand-drawn (Jazz) staff
+// lines wander, so use where they were ruled; every box on the page is then the same height.
 function measureRect(measureEl, cls) {
   const staff = measureEl.querySelector("g.staff");
   const lines = staff ? [...staff.children].filter(c => c.tagName === "path") : [];
-  const boxes = (lines.length ? lines : [staff || measureEl]).map(l => l.getBBox());
+  const boxes = (lines.length ? lines : [staff || measureEl]).map(l => {
+    const ruled = l.getAttribute && l.getAttribute("data-line");
+    if (!ruled) return l.getBBox();
+    const [x1, y, x2] = ruled.split(" ").map(Number);
+    return {x: x1, y, width: x2 - x1, height: 0};
+  });
   const x = Math.min(...boxes.map(b => b.x)), right = Math.max(...boxes.map(b => b.x + b.width));
   const y = Math.min(...boxes.map(b => b.y)), bottom = Math.max(...boxes.map(b => b.y + b.height));
   const pad = (bottom - y) * 0.5;
   const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
   r.setAttribute("class", cls);
+  r.style.stroke = "none";   // Verovio's stylesheet outlines every rect (an id rule beats ours)
   r.setAttribute("x", x); r.setAttribute("y", y - pad);
   r.setAttribute("width", right - x); r.setAttribute("height", bottom - y + 2 * pad);
   return r;
@@ -1957,7 +2426,10 @@ const player = {
     $("#clock").innerHTML = `<b>${fmt(q)}</b> / ${fmt(this.totalQ)}, bar ${mi + 1}`;
   },
 
-  setButton(text) { $("#play").textContent = text || (this.playing ? "❚❚ Pause" : "▶ Play"); },
+  setButton(text) {
+    $("#play").textContent = text || (this.playing ? "❚❚ Pause" : "▶ Play");
+    document.body.classList.toggle("playing", this.playing);
+  },
 };
 
 $("#play").onclick = () => player.toggle();

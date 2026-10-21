@@ -56,17 +56,24 @@ drums...), listen, and **Download this mix** as MP3, M4A, FLAC or WAV.
   and no tuplet bigger than a triplet is ever used.
   In Balanced and Detailed, clear scoops (the voice sliding 2-4 semitones into a held note)
   are written as small slashed grace notes, so they don't read as melody notes or runs.
-- **Lyrics** on/off: every word starts its own note; notes within one word are slurred.
+- **Lyrics** on/off (View menu): every word starts its own note; notes within one word are slurred.
 - **Harmony** (vocals): click **Add** to separate the backing vocals from the lead and write
   their harmony as a second voice, stems down, in the bars where it sings (about a minute).
   Then toggle it on and off.
 - **Clef**: treble (default) or bass.
-- **Look**: *Classic* (engraved) or *Jazz*, hand-copied like a Real Book: notes in Steinberg's
-  Petaluma music font (bundled with Verovio) and words and title in its matching handwriting,
-  Petaluma Script. Both on screen and in the PDF.
+- **Look** (in the **View** menu): *Classic* (engraved) or *Jazz*, hand-copied in the spirit of
+  a jazz fake book: notes in Steinberg's Petaluma music font (bundled with Verovio) and words in
+  its matching handwriting, Petaluma Script, drawn as if by pen. Staff lines, stems, barlines and
+  beams become ink strokes with ragged edges and changing pressure; stems lean and overshoot
+  their beams; noteheads are slanted, stretched blobs and no two glyphs are quite the same
+  shape; on screen a photocopy-grain texture speckles every edge. The variation is generated
+  (seeded by position, so a page always looks the same), and the PDF gets all of it except
+  the grain.
 - **Bars per line**: *Auto* fits as many bars as the music needs; pick a number (− / +) for
   that many bars on every line, all the same width so barlines line up in columns down the page.
   If the busiest bar can't fit, the whole page is drawn smaller rather than squeezed.
+- **Zoom**: ⌘+ / ⌘− / ⌘0 (Ctrl on Windows), pinch or Ctrl+scroll, or the Zoom buttons, 50–300%.
+  Only the music zooms; zoomed in, the page scrolls sideways.
 - **Playback**: alto sax samples or a plain synth, with the current note and measure
   highlighted. Click any measure or note to jump there; speed 50–100%.
 - **Hear** the original audio in sync: the isolated part, the backing track, the full mix, or
